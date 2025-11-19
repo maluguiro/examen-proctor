@@ -1,0 +1,127 @@
+// Prisma schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id    String @id @default(cuid())
+  email String @unique
+  role  String // 'teacher' | 'student'
+}
+
+model Exam {
+  id             String      @id @default(uuid())
+  title          String
+  status         ExamStatus  @default(DRAFT)
+  updatedAt      DateTime    @updatedAt @default(now())
+  startsAt       DateTime?
+  endsAt         DateTime?
+  publicCode     String   @unique
+  durationMin    Int?          // (singular) la que ya veníamos usando
+  durationMins   Int?          // 👈 NUEVA (plural) para calzar con tu DB
+  lives          Int          @default(3)
+  pausesAllowed  Boolean      @default(false)
+  forgiveLives   Boolean      @default(false)
+  ownerId        String       // NOT NULL en tu DB
+  createdAt      DateTime     @default(now())
+  expiresAt      DateTime?
+
+  questions      Question[]
+  attempts       Attempt[]
+}
+
+
+model Question {
+  id        String       @id @default(uuid())
+  examId    String
+  kind        QuestionKind  @default(TEXT)
+  text      String
+  options   Json?
+  answerKey Json?
+  answers     Answer[]
+
+  points    Int      @default(1)
+  createdAt DateTime @default(now()) // <-- agregado
+  allowedKinds Json?   // p.ej. ["TRUE_FALSE","MCQ"] — si null o [], es MIXTO (todas)
+
+  exam Exam @relation(fields: [examId], references: [id])
+}
+
+
+model Attempt {
+  id            String   @id @default(cuid())
+  examId        String
+  studentId     String
+  studentName   String?
+  status        String   @default("in_progress") // in_progress | submitted
+  startAt       DateTime @default(now())
+  endAt         DateTime?
+  score         Float?
+  livesUsed     Int      @default(0)
+  paused        Boolean  @default(false)
+  extraTimeSecs Int      @default(0)
+  questionOrder Json?    // orden de preguntas por alumno
+
+  exam      Exam     @relation(fields: [examId], references: [id])
+  events    Event[]
+  answers   Answer[]
+  messages  Message[]
+}
+
+model Answer {
+  id          String   @id @default(cuid())
+  attemptId   String
+  questionId  String
+  content     Json?    // mcq: ["a","c"], tf: true/false, text: string
+  isCorrect   Boolean?
+  score       Float?
+  timeSpentMs Int      @default(0)
+
+  attempt   Attempt  @relation(fields: [attemptId], references: [id])
+  question  Question @relation(fields: [questionId], references: [id])
+
+  @@unique([attemptId, questionId])
+}
+
+model Event {
+  id        String   @id @default(cuid())
+  attemptId String
+  type      String
+  reason    String?
+  ts        DateTime @default(now())
+  meta      Json?
+
+  attempt   Attempt  @relation(fields: [attemptId], references: [id])
+}
+
+model Message {
+  id        String   @id @default(cuid())
+  attemptId String
+  from      String   // 'student' | 'teacher'
+  text      String
+  ts        DateTime @default(now())
+
+  attempt   Attempt  @relation(fields: [attemptId], references: [id])
+}
+// -----------------------------
+// ENUMS FALTANTES
+// -----------------------------
+
+enum ExamStatus {
+  DRAFT  @map("draft")
+  OPEN   @map("open")
+  CLOSED @map("closed")
+}
+enum QuestionKind {
+  MULTIPLE_CHOICE @map("multiple_choice")
+  TRUE_FALSE      @map("true_false")
+  TEXT            @map("text")
+  FILL_GAPS       @map("fill_gaps")
+}
+
