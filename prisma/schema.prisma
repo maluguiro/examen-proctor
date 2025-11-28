@@ -16,24 +16,39 @@ model User {
 }
 
 model Exam {
-  id             String      @id @default(uuid())
-  title          String
-  status         ExamStatus  @default(DRAFT)
-  updatedAt      DateTime    @updatedAt @default(now())
-  startsAt       DateTime?
-  endsAt         DateTime?
-  publicCode     String   @unique
-  durationMin    Int?          // (singular) la que ya veníamos usando
-  durationMins   Int?          // 👈 NUEVA (plural) para calzar con tu DB
-  lives          Int          @default(3)
-  pausesAllowed  Boolean      @default(false)
-  forgiveLives   Boolean      @default(false)
-  ownerId        String       // NOT NULL en tu DB
-  createdAt      DateTime     @default(now())
-  expiresAt      DateTime?
+  id          String     @id @default(uuid())
+  title       String
+  status      ExamStatus @default(DRAFT)
+  updatedAt   DateTime   @updatedAt @default(now())
+  startsAt    DateTime?
+  endsAt      DateTime?
 
-  questions      Question[]
-  attempts       Attempt[]
+  publicCode  String     @unique
+
+  // 🔹 Duración (en minutos) — único campo oficial
+  durationMinutes Int?   // antes tenías durationMin / durationMins
+
+  // 🔹 Config general
+  lives          Int      @default(3)
+  pausesAllowed  Boolean  @default(false)
+  forgiveLives   Boolean  @default(false)
+
+  // 🔹 Meta docente / corrección / revisión
+  gradingMode  String    @default("auto")    // auto | manual
+  reviewMode   String    @default("manual")  // como quieras usarlo
+  openAt       DateTime?                     // cuándo pueden ver revisión
+  maxScore     Int?                          // puntaje total
+
+  teacherName  String?
+  subject      String?
+
+  // 🔹 Propietario y tiempos
+  ownerId    String
+  createdAt  DateTime @default(now())
+  expiresAt  DateTime?
+
+  questions  Question[]
+  attempts   Attempt[]
 }
 
 
