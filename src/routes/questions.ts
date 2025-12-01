@@ -121,8 +121,14 @@ questionsRouter.post("/exams/:code/questions", async (req, res) => {
       // respuesta de referencia (string) opcional
       answerStr = answer != null ? JSON.stringify(String(answer)) : null;
     } else if (kind === "FILL_IN") {
-      // estructura libre: p. ej. { blanks: 2, answers: ["x","y"] }
+      // estructura libre: p. ej. { answers: ["animal","fiel","amable"], blanks: 3 }
+      // guardamos lo que nos mande el front en answer
       answerStr = answer != null ? JSON.stringify(answer) : null;
+
+      // 💥 y también guardamos el banco de palabras (correctas + distractoras)
+      if (choices != null) {
+        choicesStr = JSON.stringify(choices);
+      }
     } else {
       return res.status(400).json({ error: "KIND_NO_SOPORTADO" });
     }
