@@ -338,22 +338,29 @@ examsRouter.post("/exams/:code/attempts/mock", async (req, res) => {
  * POST /api/exams/:code/attempts/start
  * Crea un Attempt real para el alumno.
  */
+// POST /api/exams/:code/attempts/start
+// POST /api/exams/:code/attempts/start
 examsRouter.post("/exams/:code/attempts/start", async (req, res) => {
   try {
     const { studentName } = req.body ?? {};
     const name = String(studentName || "").trim();
-    if (!name) return res.status(400).json({ error: "MISSING_NAME" });
+    if (!name) {
+      return res.status(400).json({ error: "MISSING_NAME" });
+    }
 
     const exam = await findExamByCode(req.params.code);
-    if (!exam) return res.status(404).json({ error: "EXAM_NOT_FOUND" });
+    if (!exam) {
+      return res.status(404).json({ error: "EXAM_NOT_FOUND" });
+    }
 
     const studentId = `s-${crypto.randomUUID()}`;
+
     const attempt = await prisma.attempt.create({
       data: {
         examId: exam.id,
         studentId,
         studentName: name,
-        status: "in_progress",
+        status: "in_progress", // usá el mismo string que ya venías usando
         startAt: new Date(),
         endAt: null,
         score: null,
@@ -371,7 +378,74 @@ examsRouter.post("/exams/:code/attempts/start", async (req, res) => {
 
     return res.json({ attempt });
   } catch (e: any) {
+    console.error(e);
     return res.status(500).json({ error: e?.message || String(e) });
+  }
+});
+
+/**
+ * GET /api/attempts/:id/summary
+ * Devuelve:
+ *  - remaining: vidas restantes
+ *  - secondsLeft: segundos restantes de examen
+ */
+examsRouter.get("/attempts/:id/summary", async (req, res) => {
+  try {
+    const attempt = await prisma.attempt.findUnique({
+      where: { id: req.params.id },
+    });
+
+    if (!attempt) {
+      return res.status(404).json({ error: "ATTEMPT_NOT_FOUND" });
+    }
+
+    const exam = await prisma.exam.findUnique({
+      where: { id: attempt.examId },
+    });
+
+    if (!exam) {
+      return res.status(404).json({ error: "EXAM_NOT_FOUND" });
+    }
+
+    // VIDAS: Exam.lives - Attempt.livesUsed
+    const maxLives = (exam as any).lives != null ? (exam as any).lives : 3;
+    const used =
+      (attempt as any).livesUsed != null ? (attempt as any).livesUsed : 0;
+
+    const remaining = Math.max(0, maxLives - used);
+
+    // TIEMPO
+    const durationMin =
+      (exam as any).durationMin ?? (exam as any).durationMins ?? null;
+
+    let secondsLeft: number | null = null;
+
+    if (durationMin != null && attempt.startAt) {
+      const totalSecs =
+        durationMin * 60 + ((attempt as any).extraTimeSecs ?? 0);
+
+      const elapsedSecs = Math.floor(
+        (Date.now() - attempt.startAt.getTime()) / 1000
+      );
+
+      secondsLeft = Math.max(0, totalSecs - elapsedSecs);
+    }
+
+    // Si se quedó sin tiempo y aún no está marcado como terminado, lo cerramos
+    if (secondsLeft === 0 && attempt.status !== "finished") {
+      await prisma.attempt.update({
+        where: { id: attempt.id },
+        data: {
+          status: "finished",
+          endAt: new Date(),
+        },
+      });
+    }
+
+    return res.json({ remaining, secondsLeft });
+  } catch (e: any) {
+    console.error(e);
+    return res.status(500).json({ error: e?.message || "SUMMARY_ERROR" });
   }
 });
 
@@ -669,6 +743,74 @@ examsRouter.get("/attempts/:id/review", async (req, res) => {
     });
   } catch (e: any) {
     return res.status(500).json({ error: e?.message || String(e) });
+  }
+});
+/**
+ * POST /api/s/attempt/:id/event
+ * Body: { type, meta? }
+ * Registra una violación antifraude:
+ *  - incrementa livesUsed en Attempt
+ *  - calcula vidas restantes
+ *  - cierra el intento si se queda sin vidas
+ */
+examsRouter.post("/s/attempt/:id/event", async (req, res) => {
+  try {
+    const { type, meta } = req.body ?? {};
+    if (!type) {
+      return res.status(400).json({ error: "MISSING_TYPE" });
+    }
+
+    const attempt = await prisma.attempt.findUnique({
+      where: { id: req.params.id },
+    });
+
+    if (!attempt) {
+      return res.status(404).json({ error: "ATTEMPT_NOT_FOUND" });
+    }
+
+    const exam = await prisma.exam.findUnique({
+      where: { id: attempt.examId },
+    });
+
+    if (!exam) {
+      return res.status(404).json({ error: "EXAM_NOT_FOUND" });
+    }
+
+    const maxLives = (exam as any).lives != null ? (exam as any).lives : 3;
+
+    const prevUsed =
+      (attempt as any).livesUsed != null ? (attempt as any).livesUsed : 0;
+
+    const newLivesUsed = Math.min(prevUsed + 1, maxLives);
+    const remaining = Math.max(0, maxLives - newLivesUsed);
+
+    let status = attempt.status;
+    let endAt = attempt.endAt;
+
+    if (remaining <= 0 && status !== "finished") {
+      status = "finished";
+      endAt = new Date();
+    }
+
+    await prisma.attempt.update({
+      where: { id: attempt.id },
+      data: {
+        livesUsed: newLivesUsed,
+        status,
+        endAt,
+      },
+    });
+
+    // (Si más adelante querés guardar un log de eventos,
+    // podés crear una tabla AttemptEvent acá)
+
+    return res.json({
+      ok: true,
+      livesRemaining: remaining,
+    });
+  } catch (e: any) {
+    console.error(e);
+    return res.status(500).json({ error: e?.message || "ANTIFRAUD_ERROR" });
   }
 });
 
