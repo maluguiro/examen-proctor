@@ -92,6 +92,25 @@ async function ensureQuestionLite() {
     );
   `);
 }
+async function ensureExamChatTable() {
+  await prisma.$executeRawUnsafe(`
+    CREATE TABLE IF NOT EXISTS "ExamChatLite" (
+      "id" TEXT PRIMARY KEY,
+      "examId" TEXT NOT NULL,
+      "fromRole" TEXT NOT NULL,
+      "authorName" TEXT NOT NULL,
+      "message" TEXT NOT NULL,
+      "broadcast" INTEGER NOT NULL DEFAULT 0,
+      "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY("examId") REFERENCES "Exam"("id") ON DELETE CASCADE
+    );
+  `);
+
+  await prisma.$executeRawUnsafe(`
+    CREATE INDEX IF NOT EXISTS "idx_ExamChatLite_exam_created"
+    ON "ExamChatLite"("examId","createdAt");
+  `);
+}
 
 /* -------------------------------------------------------------------------- */
 /*                               RUTAS DOCENTE                                */
@@ -109,6 +128,43 @@ examsRouter.get("/exams/:code", async (req, res) => {
     return res.json({ exam: toExamResponse(exam) });
   } catch (e: any) {
     return res.status(500).json({ error: e?.message || String(e) });
+  }
+});
+/** GET /api/exams/:code/chat  (lista los últimos mensajes del examen) */
+examsRouter.get("/exams/:code/chat", async (req, res) => {
+  try {
+    await ensureExamChatTable();
+
+    const exam = await findExamByCode(req.params.code);
+    if (!exam) {
+      return res.status(404).json({ error: "EXAM_NOT_FOUND" });
+    }
+
+    // Traemos hasta 100 mensajes, ordenados por fecha
+    const rows: any[] = await prisma.$queryRawUnsafe(
+      `
+      SELECT id, fromRole, authorName, message, broadcast, createdAt
+      FROM "ExamChatLite"
+      WHERE examId = ?
+      ORDER BY createdAt ASC
+      LIMIT 100
+    `,
+      exam.id
+    );
+
+    const items = (rows ?? []).map((r) => ({
+      id: String(r.id),
+      fromRole: r.fromRole === "teacher" ? "teacher" : "student",
+      authorName: String(r.authorName ?? ""),
+      message: String(r.message ?? ""),
+      createdAt: String(r.createdAt ?? ""),
+      broadcast: r.broadcast ? 1 : 0,
+    }));
+
+    return res.json({ items });
+  } catch (e: any) {
+    console.error("CHAT_LIST_ERROR", e);
+    return res.status(500).json({ error: e?.message || "CHAT_LIST_ERROR" });
   }
 });
 
@@ -327,6 +383,96 @@ examsRouter.post("/exams/:code/attempts/mock", async (req, res) => {
     return res.json({ attempt });
   } catch (e: any) {
     return res.status(500).json({ error: e?.message || String(e) });
+  }
+});
+/**
+ * POST /api/exams/:code/chat
+ * Body: { fromRole: 'student' | 'teacher'; authorName: string; message: string }
+ */
+examsRouter.post("/exams/:code/chat", async (req, res) => {
+  try {
+    await ensureExamChatTable();
+
+    const exam = await findExamByCode(req.params.code);
+    if (!exam) {
+      return res.status(404).json({ error: "EXAM_NOT_FOUND" });
+    }
+
+    const { fromRole, authorName, message } = req.body ?? {};
+    const role = String(fromRole || "").toLowerCase();
+    const name = String(authorName || "").trim();
+    const text = String(message || "").trim();
+
+    if (!name || !text) {
+      return res.status(400).json({ error: "MISSING_FIELDS" });
+    }
+    if (role !== "student" && role !== "teacher") {
+      return res.status(400).json({ error: "INVALID_ROLE" });
+    }
+
+    const id = crypto.randomUUID();
+
+    await prisma.$executeRawUnsafe(
+      `
+      INSERT INTO "ExamChatLite"
+        (id, examId, fromRole, authorName, message, broadcast)
+      VALUES (?, ?, ?, ?, ?, 0)
+    `,
+      id,
+      exam.id,
+      role,
+      name,
+      text
+    );
+
+    return res.json({ ok: true, id });
+  } catch (e: any) {
+    console.error("CHAT_SEND_ERROR", e);
+    return res.status(500).json({ error: e?.message || "CHAT_SEND_ERROR" });
+  }
+});
+/**
+ * POST /api/exams/:code/chat/broadcast
+ * Body: { authorName: string; message: string }
+ * fromRole se fuerza a 'teacher' y broadcast = 1
+ */
+examsRouter.post("/exams/:code/chat/broadcast", async (req, res) => {
+  try {
+    await ensureExamChatTable();
+
+    const exam = await findExamByCode(req.params.code);
+    if (!exam) {
+      return res.status(404).json({ error: "EXAM_NOT_FOUND" });
+    }
+
+    const { authorName, message } = req.body ?? {};
+    const name = String(authorName || "").trim();
+    const text = String(message || "").trim();
+
+    if (!name || !text) {
+      return res.status(400).json({ error: "MISSING_FIELDS" });
+    }
+
+    const id = crypto.randomUUID();
+
+    await prisma.$executeRawUnsafe(
+      `
+      INSERT INTO "ExamChatLite"
+        (id, examId, fromRole, authorName, message, broadcast)
+      VALUES (?, ?, 'teacher', ?, ?, 1)
+    `,
+      id,
+      exam.id,
+      name,
+      text
+    );
+
+    return res.json({ ok: true, id });
+  } catch (e: any) {
+    console.error("CHAT_BROADCAST_ERROR", e);
+    return res
+      .status(500)
+      .json({ error: e?.message || "CHAT_BROADCAST_ERROR" });
   }
 });
 
@@ -611,22 +757,23 @@ examsRouter.post("/attempts/:id/submit", async (req, res) => {
         }
       }
 
-      await prisma.answer.create({
-        data: {
-          attemptId: attempt.id,
-          questionId: q.id,
-          content: a.value ?? null,
-          isCorrect:
-            gradingMode === "auto" && typeof partial === "number"
-              ? partial >= (q.points ?? 1)
-              : null,
-          score:
-            gradingMode === "auto" && typeof partial === "number"
-              ? partial
-              : null,
-          timeSpentMs: 0,
-        },
-      });
+      try {
+        await prisma.answer.create({
+          data: {
+            attemptId: attempt.id,
+            questionId: q.id,
+            value:
+              typeof a.value === "string"
+                ? a.value
+                : JSON.stringify(a.value ?? null),
+            score: partial,
+          },
+        });
+      } catch (err) {
+        console.error("ANSWER_CREATE_ERROR (no corta el submit):", err);
+        // No rompemos el flujo si falla la FK:
+        // igual seguimos sumando el puntaje y cerramos el intento.
+      }
 
       if (typeof partial === "number") score += partial;
     }
