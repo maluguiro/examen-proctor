@@ -594,6 +594,89 @@ examsRouter.get("/attempts/:id/summary", async (req, res) => {
     return res.status(500).json({ error: e?.message || "SUMMARY_ERROR" });
   }
 });
+/**
+ * PATCH /api/attempts/:id/lives
+ * Body: { op: "increment" | "decrement", reason?: string }
+ * - "increment": le devolvés 1 vida (baja livesUsed)
+ * - "decrement": le quitás 1 vida (sube livesUsed)
+ */
+examsRouter.patch("/attempts/:id/lives", async (req, res) => {
+  try {
+    const { op, reason } = req.body ?? {};
+
+    if (op !== "increment" && op !== "decrement") {
+      return res.status(400).json({ error: "INVALID_OP" });
+    }
+
+    const attempt = await prisma.attempt.findUnique({
+      where: { id: req.params.id },
+    });
+
+    if (!attempt) {
+      return res.status(404).json({ error: "ATTEMPT_NOT_FOUND" });
+    }
+
+    const exam = await prisma.exam.findUnique({
+      where: { id: attempt.examId },
+    });
+
+    if (!exam) {
+      return res.status(404).json({ error: "EXAM_NOT_FOUND" });
+    }
+
+    const maxLives =
+      (exam as any).lives != null ? Number((exam as any).lives) : 3;
+    let used =
+      (attempt as any).livesUsed != null
+        ? Number((attempt as any).livesUsed)
+        : 0;
+
+    // increment => le SUMO una vida => uso menos
+    if (op === "increment") {
+      used = Math.max(0, used - 1);
+    }
+
+    // decrement => le RESTO una vida => uso más
+    if (op === "decrement") {
+      used = Math.min(maxLives, used + 1);
+    }
+
+    const updated = await prisma.attempt.update({
+      where: { id: attempt.id },
+      data: { livesUsed: used },
+    });
+
+    const remaining = Math.max(0, maxLives - used);
+
+    // Opcional: loguear el evento en Event, si tenés tabla de eventos
+    try {
+      await prisma.event.create({
+        data: {
+          attemptId: attempt.id,
+          type: "LIVES_PATCH",
+          reason:
+            reason ||
+            (op === "increment"
+              ? "MANUAL_LIFE_INCREMENT"
+              : "MANUAL_LIFE_DECREMENT"),
+        },
+      });
+    } catch (e) {
+      console.error("EVENT_LIVES_PATCH_ERROR", e);
+      // No rompemos la respuesta por esto
+    }
+
+    return res.json({
+      remaining, // vidas restantes (lo más útil para el front)
+      used, // cuántas usó
+      maxLives, // tope del examen
+      attemptId: updated.id,
+    });
+  } catch (e: any) {
+    console.error("PATCH_LIVES_ERROR", e);
+    return res.status(500).json({ error: e?.message || "PATCH_LIVES_ERROR" });
+  }
+});
 
 /**
  * GET /api/exams/:code/paper
