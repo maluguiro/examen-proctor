@@ -313,6 +313,8 @@ examsRouter.get("/exams/:code/attempts", async (req, res) => {
         livesUsed: true,
         paused: true,
         startAt: true,
+        endAt: true,
+        status: true,
       },
     });
 
@@ -334,13 +336,16 @@ examsRouter.get("/exams/:code/attempts", async (req, res) => {
       const maxLives = exam.lives ?? 3;
       const remaining = Math.max(0, maxLives - used);
       const vio = byAttempt.get(a.id) ?? [];
+
       return {
         id: a.id,
         studentName: a.studentName || "(sin nombre)",
         livesRemaining: remaining,
         paused: !!a.paused,
+        status: a.status ?? "in_progress", // 👈 ahora el front tiene status
         violations: JSON.stringify(vio),
-        startedAt: a.startAt.toISOString(),
+        startedAt: a.startAt ? a.startAt.toISOString() : null,
+        finishedAt: a.endAt ? a.endAt.toISOString() : null, // 👈 CLAVE
       };
     });
 
