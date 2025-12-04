@@ -3,6 +3,7 @@
 import { Router } from "express";
 import { prisma } from "../prisma";
 import crypto from "crypto";
+import PDFDocument from "pdfkit"; // 👈 NUEVO
 
 export const examsRouter = Router();
 
@@ -75,6 +76,24 @@ function toMetaResponse(exam: any) {
     openAt: exam.openAt ?? null,
   };
 }
+function formatDateTimeShort(value: any): string {
+  if (!value) return "—";
+  try {
+    const d = value instanceof Date ? value : new Date(value);
+    if (isNaN(d.getTime())) return "—";
+
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const yyyy = d.getFullYear();
+    const mm = pad(d.getMonth() + 1);
+    const dd = pad(d.getDate());
+    const hh = pad(d.getHours());
+    const mi = pad(d.getMinutes());
+
+    return `${yyyy}-${mm}-${dd} ${hh}:${mi}`;
+  } catch {
+    return "—";
+  }
+}
 
 /** Asegura la tabla QuestionLite (se comparte el formato con el builder) */
 async function ensureQuestionLite() {
@@ -111,6 +130,57 @@ async function ensureExamChatTable() {
     ON "ExamChatLite"("examId","createdAt");
   `);
 }
+/**
+ * GET /api/exams
+ * Lista exámenes, opcionalmente filtrando por teacherName y/o subject.
+ * Ejemplo:
+ *   GET /api/exams?teacherName=Gomez
+ */
+examsRouter.get("/exams", async (req, res) => {
+  try {
+    const teacherNameRaw = String(req.query.teacherName ?? "").trim();
+    const subjectRaw = String(req.query.subject ?? "").trim();
+
+    const where: any = {};
+
+    if (teacherNameRaw) {
+      where.teacherName = {
+        contains: teacherNameRaw,
+        mode: "insensitive",
+      };
+    }
+
+    if (subjectRaw) {
+      where.subject = {
+        contains: subjectRaw,
+        mode: "insensitive",
+      };
+    }
+
+    const exams = await prisma.exam.findMany({
+      where,
+      orderBy: {
+        createdAt: "desc", // si por alguna razón no existe, podés cambiarlo a id
+      },
+    });
+
+    const items = exams.map((e: any) => ({
+      id: e.id,
+      code: e.publicCode ?? e.id.slice(0, 6),
+      title: e.title ?? "(sin título)",
+      subject: e.subject ?? null,
+      teacherName: e.teacherName ?? null,
+      status: e.status ?? "DRAFT",
+      openAt: e.openAt ? e.openAt.toISOString() : null,
+      createdAt: e.createdAt ? e.createdAt.toISOString() : null,
+    }));
+
+    return res.json({ exams: items });
+  } catch (e: any) {
+    console.error("LIST_EXAMS_ERROR", e);
+    return res.status(500).json({ error: e?.message || "LIST_EXAMS_ERROR" });
+  }
+});
 
 /* -------------------------------------------------------------------------- */
 /*                               RUTAS DOCENTE                                */
@@ -352,6 +422,185 @@ examsRouter.get("/exams/:code/attempts", async (req, res) => {
     return res.json({ attempts: out });
   } catch (e: any) {
     return res.status(500).json({ error: e?.message || String(e) });
+  }
+});
+/**
+ * GET /api/exams/:code/activity.pdf
+ * Genera un PDF con:
+ *  - Info del examen
+ *  - Intentos + resumen antifraude
+ *  - Chat del examen
+ */
+examsRouter.get("/exams/:code/activity.pdf", async (req, res) => {
+  try {
+    const exam = await findExamByCode(req.params.code);
+    if (!exam) {
+      return res.status(404).json({ error: "EXAM_NOT_FOUND" });
+    }
+
+    // ---------- Intentos + eventos antifraude ----------
+    const attempts = await prisma.attempt.findMany({
+      where: { examId: exam.id },
+      orderBy: { startAt: "asc" },
+      select: {
+        id: true,
+        studentName: true,
+        livesUsed: true,
+        paused: true,
+        startAt: true,
+        endAt: true,
+        status: true,
+      },
+    });
+
+    const attemptIds = attempts.map((a) => a.id);
+
+    const events =
+      attemptIds.length > 0
+        ? await prisma.event.findMany({
+            where: { attemptId: { in: attemptIds } },
+            select: {
+              attemptId: true,
+              type: true,
+              reason: true,
+            },
+          })
+        : [];
+
+    const eventsByAttempt = new Map<
+      string,
+      { type: string; reason: string | null }[]
+    >();
+
+    for (const ev of events) {
+      const arr = eventsByAttempt.get(ev.attemptId) ?? [];
+      arr.push({
+        type: ev.type,
+        reason: ev.reason ?? null,
+      });
+      eventsByAttempt.set(ev.attemptId, arr);
+    }
+
+    const maxLives = (exam as any).lives != null ? Number(exam.lives) : 3;
+
+    // ---------- Chat ----------
+    await ensureExamChatTable();
+    const chatRows: any[] = await prisma.$queryRawUnsafe(
+      `
+      SELECT id, fromRole, authorName, message, broadcast, createdAt
+      FROM "ExamChatLite"
+      WHERE examId = ?
+      ORDER BY createdAt ASC
+    `,
+      exam.id
+    );
+
+    // ---------- Armamos el PDF ----------
+    const doc = new PDFDocument({ margin: 50 });
+
+    const code =
+      exam.publicCode ?? (exam.id ? exam.id.slice(0, 6) : String(exam.id));
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="actividad-${code}.pdf"`
+    );
+
+    // Pipea la salida al response
+    (doc as any).pipe(res);
+
+    // TÍTULO
+    doc.fontSize(18).text(`Registro de actividad — ${exam.title || code}`, {
+      align: "center",
+    });
+    doc.moveDown();
+
+    // Info básica del examen
+    doc.fontSize(12);
+    doc.text(`Código: ${code}`);
+    if ((exam as any).teacherName) {
+      doc.text(`Docente: ${(exam as any).teacherName}`);
+    }
+    if ((exam as any).subject) {
+      doc.text(`Materia: ${(exam as any).subject}`);
+    }
+    if ((exam as any).durationMinutes != null) {
+      doc.text(`Duración: ${(exam as any).durationMinutes} minutos`);
+    }
+    doc.text(`Vidas configuradas: ${maxLives}`);
+    doc.moveDown();
+
+    // ===================== SECCIÓN INTENTOS =====================
+    doc.fontSize(14).text("Intentos de alumnos", { underline: true });
+    doc.moveDown(0.5);
+
+    if (attempts.length === 0) {
+      doc.fontSize(12).text("No hay intentos registrados para este examen.");
+    } else {
+      attempts.forEach((a, index) => {
+        const used = a.livesUsed ?? 0;
+        const remaining = Math.max(0, maxLives - used);
+        const evs = eventsByAttempt.get(a.id) ?? [];
+
+        doc
+          .fontSize(12)
+          .text(`${index + 1}. Alumno: ${a.studentName || "(sin nombre)"}`);
+        doc.text(`   Estado: ${a.status ?? "in_progress"}`);
+        doc.text(`   Inicio: ${formatDateTimeShort(a.startAt)}`);
+        doc.text(`   Fin: ${formatDateTimeShort(a.endAt)}`);
+        doc.text(`   Vidas restantes: ${remaining}`);
+        if (a.paused) {
+          doc.text(`   (Intento pausado)`);
+        }
+
+        if (evs.length > 0) {
+          const frases = evs.map((ev) =>
+            ev.reason ? `${ev.type} (${ev.reason})` : ev.type
+          );
+          doc.text(`   Eventos antifraude: ${frases.join(", ")}`);
+        }
+
+        doc.moveDown(0.6);
+      });
+    }
+
+    // ===================== SECCIÓN CHAT =====================
+    doc.addPage();
+    doc.fontSize(14).text("Chat del examen", { underline: true });
+    doc.moveDown(0.5);
+
+    if (!chatRows.length) {
+      doc.fontSize(12).text("No hubo mensajes en el chat.");
+    } else {
+      chatRows.forEach((m: any) => {
+        const when = formatDateTimeShort(m.createdAt);
+        const role =
+          m.fromRole === "teacher"
+            ? "Docente"
+            : m.fromRole === "student"
+            ? "Alumno"
+            : String(m.fromRole || "");
+        const broadcast = m.broadcast ? " · 📢 broadcast" : "";
+        const author = `${
+          m.authorName || "(sin nombre)"
+        } (${role}${broadcast})`;
+
+        doc.fontSize(11).text(`[${when}] ${author}`);
+        doc.text(`   ${m.message}`);
+        doc.moveDown(0.4);
+      });
+    }
+
+    // Cerramos el doc
+    doc.end();
+  } catch (e: any) {
+    console.error("ACTIVITY_PDF_ERROR", e);
+    if (!res.headersSent) {
+      return res
+        .status(500)
+        .json({ error: e?.message || "ACTIVITY_PDF_ERROR" });
+    }
   }
 });
 
