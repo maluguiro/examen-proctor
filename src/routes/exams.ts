@@ -1067,6 +1067,122 @@ examsRouter.patch("/attempts/:id/lives", async (req, res) => {
 });
 
 /**
+ * POST /api/attempts/:id/antifraud
+ * Lo usa el ALUMNO cuando se detecta una violación antifraude en el front.
+ * - Descuenta 1 vida (usando Attempt.livesUsed)
+ * - Registra un Event para que el tablero lo vea en la columna "Antifraude"
+ */
+examsRouter.post("/attempts/:id/antifraud", async (req, res) => {
+  try {
+    const attemptId = req.params.id;
+    const { type, meta } = req.body ?? {};
+
+    if (!type) {
+      return res.status(400).json({ error: "MISSING_TYPE" });
+    }
+
+    // Normalizamos el tipo a algo consistente (ej: "blur" -> "BLUR")
+    const rawType = String(type || "").toLowerCase();
+    const normalizedType = rawType.replace(/[^a-z0-9]+/g, "_").toUpperCase();
+
+    const attempt = await prisma.attempt.findUnique({
+      where: { id: attemptId },
+    });
+
+    if (!attempt) {
+      return res.status(404).json({ error: "ATTEMPT_NOT_FOUND" });
+    }
+
+    const exam = await prisma.exam.findUnique({
+      where: { id: attempt.examId },
+    });
+
+    if (!exam) {
+      return res.status(404).json({ error: "EXAM_NOT_FOUND" });
+    }
+
+    // Si el examen ya está cerrado, registramos el evento pero no tocamos vidas
+    const isOpen = String(exam.status).toUpperCase() === "OPEN";
+
+    // Vida máxima definida en el examen (default 3)
+    const maxLives =
+      (exam as any).lives != null ? Number((exam as any).lives) : 3;
+
+    // Vida usadas hasta ahora
+    let used =
+      (attempt as any).livesUsed != null
+        ? Number((attempt as any).livesUsed)
+        : 0;
+
+    // Tipos que realmente descuentan vida
+    const PENALTY_TYPES = new Set<string>([
+      "BLUR",
+      "VISIBILITY_HIDDEN",
+      "COPY",
+      "CUT",
+      "PASTE",
+      "PRINT",
+      "PRINTSCREEN",
+      "FULLSCREEN_EXIT",
+    ]);
+
+    if (isOpen && PENALTY_TYPES.has(normalizedType)) {
+      // suma 1 vida usada, sin pasarse del máximo
+      used = Math.min(maxLives, used + 1);
+
+      await prisma.attempt.update({
+        where: { id: attempt.id },
+        data: { livesUsed: used },
+      });
+    }
+
+    // Registramos SIEMPRE el evento (para que el tablero vea la traza)
+    await prisma.event.create({
+      data: {
+        attemptId: attempt.id,
+        type: "ANTIFRAUD",
+        reason: normalizedType,
+        meta: meta ?? null,
+      },
+    });
+
+    const remaining = Math.max(0, maxLives - used);
+
+    // Si se quedó sin vidas, cerramos el intento
+    if (isOpen && remaining === 0 && attempt.status !== "finished") {
+      await prisma.attempt.update({
+        where: { id: attempt.id },
+        data: {
+          status: "finished",
+          endAt: new Date(),
+        },
+      });
+
+      await prisma.event.create({
+        data: {
+          attemptId: attempt.id,
+          type: "AUTO_FINISH_LIVES",
+          reason: "NO_LIVES_LEFT",
+          meta: null,
+        },
+      });
+    }
+
+    return res.json({
+      remaining,
+      used,
+      maxLives,
+      status: remaining === 0 ? "finished" : attempt.status,
+    });
+  } catch (e: any) {
+    console.error("ANTIFRAUD_ERROR", e);
+    return res.status(500).json({
+      error: e?.message || "ANTIFRAUD_ERROR",
+    });
+  }
+});
+
+/**
  * GET /api/exams/:code/paper
  * Devuelve el "paper" del examen: título + lista de preguntas desde QuestionLite.
  */
