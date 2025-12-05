@@ -47,12 +47,14 @@ async function findExamByCode(codeRaw: string) {
 
 /** Devuelve el objeto que espera el front docente en `/exams/:code` */
 function toExamResponse(exam: any) {
+  const d = (exam as any).durationMin ?? (exam as any).durationMins ?? null;
+
   return {
     id: exam.id,
     title: exam.title,
-    status: exam.status, // ExamStatus enum -> front lo muestra como string
-    durationMinutes:
-      typeof exam.durationMinutes === "number" ? exam.durationMinutes : null,
+    status: exam.status,
+    // el front docente espera durationMinutes
+    durationMinutes: typeof d === "number" ? d : null,
     lives: typeof exam.lives === "number" ? exam.lives : null,
     code: exam.publicCode ?? exam.id.slice(0, 6),
   };
@@ -252,29 +254,42 @@ examsRouter.get("/exams/:code/chat", async (req, res) => {
 examsRouter.put("/exams/:code", async (req, res) => {
   try {
     const exam = await findExamByCode(req.params.code);
-    if (!exam) return res.status(404).json({ error: "EXAM_NOT_FOUND" });
+    if (!exam) {
+      return res.status(404).json({ error: "EXAM_NOT_FOUND" });
+    }
 
     const body = req.body ?? {};
     const data: any = {};
 
+    // título
     if (typeof body.title === "string" && body.title.trim()) {
       data.title = body.title.trim();
     }
 
-    // Soportamos tanto durationMinutes nuevo como durationMin viejo (por compat)
+    // 🔹 duración: soportamos durationMinutes o durationMin
     if (body.durationMinutes !== undefined && body.durationMinutes !== null) {
       const v = Number(body.durationMinutes);
-      if (!Number.isNaN(v) && v >= 0) data.durationMinutes = Math.floor(v);
+      if (!Number.isNaN(v) && v >= 0) {
+        const mins = Math.floor(v);
+        data.durationMin = mins;
+        data.durationMins = mins;
+      }
     } else if (body.durationMin !== undefined && body.durationMin !== null) {
       const v = Number(body.durationMin);
-      if (!Number.isNaN(v) && v >= 0) data.durationMinutes = Math.floor(v);
+      if (!Number.isNaN(v) && v >= 0) {
+        const mins = Math.floor(v);
+        data.durationMin = mins;
+        data.durationMins = mins;
+      }
     }
 
+    // vidas
     if (body.lives !== undefined && body.lives !== null) {
       const v = Math.max(0, Math.floor(Number(body.lives) || 0));
       data.lives = v;
     }
 
+    // abrir/cerrar examen
     if (typeof body.isOpen === "boolean") {
       data.status = (body.isOpen ? "OPEN" : "DRAFT") as any;
     }
@@ -286,6 +301,7 @@ examsRouter.put("/exams/:code", async (req, res) => {
 
     return res.json({ exam: toExamResponse(updated) });
   } catch (e: any) {
+    console.error(e);
     return res.status(500).json({ error: e?.message || String(e) });
   }
 });
@@ -848,6 +864,117 @@ examsRouter.get("/attempts/:id/summary", async (req, res) => {
     return res.status(500).json({ error: e?.message || "SUMMARY_ERROR" });
   }
 });
+// POST /api/attempts/:id/antifraud
+// Body: { type: string, meta?: any }
+// - Registra un evento antifraude en Event
+// - Si el tipo es penalizable, descuenta 1 vida
+// - Si se queda sin vidas, marca el intento como terminado
+examsRouter.post("/attempts/:id/antifraud", async (req, res) => {
+  try {
+    const { type, meta } = req.body ?? {};
+    const rawType = String(type || "").trim();
+
+    if (!rawType) {
+      return res.status(400).json({ error: "MISSING_TYPE" });
+    }
+
+    const tNorm = rawType.toLowerCase(); // lo que manda el front: "blur", "copy", etc.
+
+    // Buscamos intento + examen
+    const attempt = await prisma.attempt.findUnique({
+      where: { id: req.params.id },
+    });
+
+    if (!attempt) {
+      return res.status(404).json({ error: "ATTEMPT_NOT_FOUND" });
+    }
+
+    const exam = await prisma.exam.findUnique({
+      where: { id: attempt.examId },
+    });
+
+    if (!exam) {
+      return res.status(404).json({ error: "EXAM_NOT_FOUND" });
+    }
+
+    // Solo penalizamos si el examen está abierto
+    const isOpen = String(exam.status || "").toLowerCase() === "open";
+    if (!isOpen) {
+      return res.status(403).json({ error: "EXAM_CLOSED" });
+    }
+
+    // Tipos que RESTAN vida (los que dispara el front)
+    const PENALTY = new Set([
+      "blur",
+      "copy",
+      "cut",
+      "paste",
+      "print",
+      "printscreen",
+      "fullscreen-exit",
+    ]);
+
+    const maxLives =
+      (exam as any).lives != null ? Number((exam as any).lives) : 3;
+    let used =
+      (attempt as any).livesUsed != null
+        ? Number((attempt as any).livesUsed)
+        : 0;
+
+    // Si el tipo está en la lista, consumimos una vida
+    if (PENALTY.has(tNorm)) {
+      used = Math.min(maxLives, used + 1);
+    }
+
+    const remaining = Math.max(0, maxLives - used);
+
+    let status = attempt.status ?? "in_progress";
+    let endAt = attempt.endAt;
+
+    let autoSubmitted = false;
+    // Si se quedó sin vidas, marcamos terminado
+    if (remaining <= 0 && status !== "finished") {
+      status = "finished";
+      endAt = new Date();
+      autoSubmitted = true;
+    }
+
+    // Guardamos cambios en Attempt
+    const updated = await prisma.attempt.update({
+      where: { id: attempt.id },
+      data: {
+        livesUsed: used,
+        status,
+        endAt,
+      },
+    });
+
+    // Registramos el evento en la tabla Event
+    try {
+      await prisma.event.create({
+        data: {
+          attemptId: attempt.id,
+          type: "ANTIFRAUD",
+          reason: tNorm, // ej: "blur", "copy"
+          meta: meta ?? undefined,
+        },
+      });
+    } catch (e) {
+      console.error("EVENT_ANTIFRAUD_ERROR", e);
+      // No rompemos la respuesta si falla solo el log
+    }
+
+    return res.json({
+      remaining, // vidas restantes
+      status: updated.status,
+      autoSubmitted,
+    });
+  } catch (e: any) {
+    console.error("ANTIFRAUD_ERROR", e);
+    return res.status(500).json({ error: e?.message || "ANTIFRAUD_ERROR" });
+  }
+});
+
 /**
  * PATCH /api/attempts/:id/lives
  * Body: { op: "increment" | "decrement", reason?: string }
@@ -1099,10 +1226,7 @@ examsRouter.post("/attempts/:id/submit", async (req, res) => {
           data: {
             attemptId: attempt.id,
             questionId: q.id,
-            value:
-              typeof a.value === "string"
-                ? a.value
-                : JSON.stringify(a.value ?? null),
+            content: typeof a.value === "string" ? a.value : a.value ?? null,
             score: partial,
           },
         });

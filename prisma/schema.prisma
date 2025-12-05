@@ -16,39 +16,34 @@ model User {
 }
 
 model Exam {
-  id          String     @id @default(uuid())
-  title       String
-  status      ExamStatus @default(DRAFT)
-  updatedAt   DateTime   @updatedAt @default(now())
-  startsAt    DateTime?
-  endsAt      DateTime?
+  id         String      @id @default(uuid())
+  title      String
+  status     ExamStatus  @default(DRAFT)
+  updatedAt  DateTime    @updatedAt @default(now())
+  startsAt   DateTime?
+  endsAt     DateTime?
+  publicCode String      @unique
 
-  publicCode  String     @unique
+  // Duración: seguimos usando estos campos en la DB
+  durationMin  Int?   // viejo
+  durationMins Int?   // compatibilidad
 
-  // 🔹 Duración (en minutos) — único campo oficial
-  durationMinutes Int?   // antes tenías durationMin / durationMins
+  lives         Int      @default(3)
+  pausesAllowed Boolean  @default(false)
+  forgiveLives  Boolean  @default(false)
+  ownerId       String
+  createdAt     DateTime @default(now())
+  expiresAt     DateTime?
 
-  // 🔹 Config general
-  lives          Int      @default(3)
-  pausesAllowed  Boolean  @default(false)
-  forgiveLives   Boolean  @default(false)
+  // 🔹 NUEVOS CAMPOS para la meta docente
+  teacherName String?    // ej: "Prof. Gómez"
+  subject     String?    // ej: "Matemática I"
+  gradingMode String     @default("auto") // 'auto' | 'manual'
+  maxScore    Int?
+  openAt      DateTime?
 
-  // 🔹 Meta docente / corrección / revisión
-  gradingMode  String    @default("auto")    // auto | manual
-  reviewMode   String    @default("manual")  // como quieras usarlo
-  openAt       DateTime?                     // cuándo pueden ver revisión
-  maxScore     Int?                          // puntaje total
-
-  teacherName  String?
-  subject      String?
-
-  // 🔹 Propietario y tiempos
-  ownerId    String
-  createdAt  DateTime @default(now())
-  expiresAt  DateTime?
-
-  questions  Question[]
-  attempts   Attempt[]
+  questions Question[]
+  attempts  Attempt[]
 }
 
 
