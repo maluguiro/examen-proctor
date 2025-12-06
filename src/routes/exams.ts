@@ -1483,6 +1483,7 @@ examsRouter.get("/attempts/:id/review", async (req, res) => {
  *  - incrementa livesUsed en Attempt
  *  - calcula vidas restantes
  *  - cierra el intento si se queda sin vidas
+ *  - crea un Event para que el tablero lo vea en "Antifraude"
  */
 examsRouter.post("/s/attempt/:id/event", async (req, res) => {
   try {
@@ -1490,6 +1491,12 @@ examsRouter.post("/s/attempt/:id/event", async (req, res) => {
     if (!type) {
       return res.status(400).json({ error: "MISSING_TYPE" });
     }
+
+    const rawType = String(type || "").trim();
+    const normalizedType = rawType
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+      .toUpperCase();
 
     const attempt = await prisma.attempt.findUnique({
       where: { id: req.params.id },
@@ -1507,10 +1514,13 @@ examsRouter.post("/s/attempt/:id/event", async (req, res) => {
       return res.status(404).json({ error: "EXAM_NOT_FOUND" });
     }
 
-    const maxLives = (exam as any).lives != null ? (exam as any).lives : 3;
+    const maxLives =
+      (exam as any).lives != null ? Number((exam as any).lives) : 3;
 
     const prevUsed =
-      (attempt as any).livesUsed != null ? (attempt as any).livesUsed : 0;
+      (attempt as any).livesUsed != null
+        ? Number((attempt as any).livesUsed)
+        : 0;
 
     const newLivesUsed = Math.min(prevUsed + 1, maxLives);
     const remaining = Math.max(0, maxLives - newLivesUsed);
@@ -1532,8 +1542,20 @@ examsRouter.post("/s/attempt/:id/event", async (req, res) => {
       },
     });
 
-    // (Si más adelante querés guardar un log de eventos,
-    // podés crear una tabla AttemptEvent acá)
+    // 👇 AQUÍ ES LA CLAVE: registramos el evento para el tablero
+    try {
+      await prisma.event.create({
+        data: {
+          attemptId: attempt.id,
+          type: "ANTIFRAUD",
+          reason: normalizedType, // ej: BLUR, COPY, FULLSCREEN_EXIT
+          meta: meta ?? null,
+        },
+      });
+    } catch (err) {
+      console.error("EVENT_ANTIFRAUD_S_ROUTE_ERROR", err);
+      // no rompemos la respuesta al alumno
+    }
 
     return res.json({
       ok: true,
