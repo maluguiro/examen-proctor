@@ -865,123 +865,6 @@ examsRouter.get("/attempts/:id/summary", async (req, res) => {
   }
 });
 
-// POST /api/attempts/:id/antifraud
-// Body: { type: string, meta?: any }
-//
-// - Registra un evento antifraude en Event
-// - Si el tipo es penalizable, descuenta 1 vida
-// - Si se queda sin vidas, marca el intento como terminado
-examsRouter.post("/attempts/:id/antifraud", async (req, res) => {
-  try {
-    const { type, meta } = req.body ?? {};
-    const rawType = String(type || "").trim();
-
-    if (!rawType) {
-      return res.status(400).json({ error: "MISSING_TYPE" });
-    }
-
-    // lo que manda el front: "blur", "copy", "fullscreen-exit", etc.
-    const tNorm = rawType.toLowerCase();
-    console.log("[ANTIFRAUD] intento", req.params.id, "tipo", tNorm);
-
-    // 1) Buscamos Attempt + Exam
-    const attempt = await prisma.attempt.findUnique({
-      where: { id: req.params.id },
-    });
-
-    if (!attempt) {
-      console.error("[ANTIFRAUD] ATTEMPT_NOT_FOUND", req.params.id);
-      return res.status(404).json({ error: "ATTEMPT_NOT_FOUND" });
-    }
-
-    const exam = await prisma.exam.findUnique({
-      where: { id: attempt.examId },
-    });
-
-    if (!exam) {
-      console.error("[ANTIFRAUD] EXAM_NOT_FOUND", attempt.examId);
-      return res.status(404).json({ error: "EXAM_NOT_FOUND" });
-    }
-
-    // Solo penalizamos si el examen está abierto
-    const isOpen = String(exam.status || "").toLowerCase() === "open";
-    if (!isOpen) {
-      console.log("[ANTIFRAUD] examen cerrado, no se penaliza");
-      return res.status(403).json({ error: "EXAM_CLOSED" });
-    }
-
-    // Tipos que RESTAN vida (coinciden con los del front)
-    const PENALTY = new Set([
-      "blur",
-      "copy",
-      "cut",
-      "paste",
-      "print",
-      "printscreen",
-      "fullscreen-exit",
-    ]);
-
-    const maxLives =
-      (exam as any).lives != null ? Number((exam as any).lives) : 3;
-    let used =
-      (attempt as any).livesUsed != null
-        ? Number((attempt as any).livesUsed)
-        : 0;
-
-    if (PENALTY.has(tNorm)) {
-      used = Math.min(maxLives, used + 1);
-    }
-
-    const remaining = Math.max(0, maxLives - used);
-
-    let status = attempt.status ?? "in_progress";
-    let endAt = attempt.endAt;
-    let autoSubmitted = false;
-
-    // Si se quedó sin vidas, se termina el intento
-    if (remaining <= 0 && status !== "finished") {
-      status = "finished";
-      endAt = new Date();
-      autoSubmitted = true;
-    }
-
-    // 2) Actualizamos el Attempt
-    const updated = await prisma.attempt.update({
-      where: { id: attempt.id },
-      data: {
-        livesUsed: used,
-        status,
-        endAt,
-      },
-    });
-
-    // 3) Registramos el evento en Event
-    try {
-      await prisma.event.create({
-        data: {
-          attemptId: attempt.id,
-          type: "ANTIFRAUD",
-          reason: tNorm, // ej: "blur", "copy", etc.
-          meta: meta ?? undefined,
-        },
-      });
-      console.log("[ANTIFRAUD] evento creado OK", tNorm);
-    } catch (e) {
-      console.error("[ANTIFRAUD] error al crear Event", e);
-      // no rompemos la respuesta si es solo el log
-    }
-
-    return res.json({
-      remaining,
-      status: updated.status,
-      autoSubmitted,
-    });
-  } catch (e: any) {
-    console.error("ANTIFRAUD_ERROR", e);
-    return res.status(500).json({ error: e?.message || "ANTIFRAUD_ERROR" });
-  }
-});
-
 /**
  * PATCH /api/attempts/:id/lives
  * Body: { op: "increment" | "decrement", reason?: string }
@@ -1068,9 +951,14 @@ examsRouter.patch("/attempts/:id/lives", async (req, res) => {
 
 /**
  * POST /api/attempts/:id/antifraud
+ *
  * Lo usa el ALUMNO cuando se detecta una violación antifraude en el front.
- * - Descuenta 1 vida (usando Attempt.livesUsed)
- * - Registra un Event para que el tablero lo vea en la columna "Antifraude"
+ * - Registra un Event (para la columna "Antifraude" del tablero)
+ * - Ajusta Attempt.livesUsed
+ * - Calcula vidas restantes
+ * - Si se queda sin vidas, cierra el intento
+ *
+ * Body: { type: string, meta?: any }
  */
 examsRouter.post("/attempts/:id/antifraud", async (req, res) => {
   try {
@@ -1081,9 +969,29 @@ examsRouter.post("/attempts/:id/antifraud", async (req, res) => {
       return res.status(400).json({ error: "MISSING_TYPE" });
     }
 
-    // Normalizamos el tipo a algo consistente (ej: "blur" -> "BLUR")
-    const rawType = String(type || "").toLowerCase();
-    const normalizedType = rawType.replace(/[^a-z0-9]+/g, "_").toUpperCase();
+    let rawType = String(type || "")
+      .trim()
+      .toLowerCase();
+
+    // 🔴 Normalizamos cualquier variante de "fullscreen exit"
+    // ej: "fullscreen-exit", "FULLSCREEN_EXIT", "fullscreen exit"
+    if (rawType.includes("fullscreen") && rawType.includes("exit")) {
+      rawType = "fullscreen_exit";
+    }
+
+    const normalizedType = rawType
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "")
+      .toUpperCase();
+
+    console.log(
+      "[ANTIFRAUD]",
+      attemptId,
+      "type recibido:",
+      type,
+      "normalizado:",
+      normalizedType
+    );
 
     const attempt = await prisma.attempt.findUnique({
       where: { id: attemptId },
@@ -1101,14 +1009,11 @@ examsRouter.post("/attempts/:id/antifraud", async (req, res) => {
       return res.status(404).json({ error: "EXAM_NOT_FOUND" });
     }
 
-    // Si el examen ya está cerrado, registramos el evento pero no tocamos vidas
-    const isOpen = String(exam.status).toUpperCase() === "OPEN";
-
-    // Vida máxima definida en el examen (default 3)
+    // Vida máxima definida en el examen (default 3 si está null)
     const maxLives =
       (exam as any).lives != null ? Number((exam as any).lives) : 3;
 
-    // Vida usadas hasta ahora
+    // Vidas usadas hasta ahora
     let used =
       (attempt as any).livesUsed != null
         ? Number((attempt as any).livesUsed)
@@ -1126,17 +1031,36 @@ examsRouter.post("/attempts/:id/antifraud", async (req, res) => {
       "FULLSCREEN_EXIT",
     ]);
 
-    if (isOpen && PENALTY_TYPES.has(normalizedType)) {
+    const penaliza = PENALTY_TYPES.has(normalizedType);
+    console.log("[ANTIFRAUD] penaliza?", penaliza);
+
+    if (penaliza) {
       // suma 1 vida usada, sin pasarse del máximo
       used = Math.min(maxLives, used + 1);
-
-      await prisma.attempt.update({
-        where: { id: attempt.id },
-        data: { livesUsed: used },
-      });
     }
 
-    // Registramos SIEMPRE el evento (para que el tablero vea la traza)
+    const remaining = Math.max(0, maxLives - used);
+
+    let status = attempt.status ?? "in_progress";
+    let endAt = attempt.endAt;
+
+    // Si se quedó sin vidas, cerramos el intento
+    if (remaining === 0 && status !== "finished") {
+      status = "finished";
+      endAt = new Date();
+    }
+
+    // Actualizamos Attempt
+    const updated = await prisma.attempt.update({
+      where: { id: attempt.id },
+      data: {
+        livesUsed: used,
+        status,
+        endAt,
+      },
+    });
+
+    // Registramos SIEMPRE el evento para que el tablero vea la traza
     await prisma.event.create({
       data: {
         attemptId: attempt.id,
@@ -1146,33 +1070,11 @@ examsRouter.post("/attempts/:id/antifraud", async (req, res) => {
       },
     });
 
-    const remaining = Math.max(0, maxLives - used);
-
-    // Si se quedó sin vidas, cerramos el intento
-    if (isOpen && remaining === 0 && attempt.status !== "finished") {
-      await prisma.attempt.update({
-        where: { id: attempt.id },
-        data: {
-          status: "finished",
-          endAt: new Date(),
-        },
-      });
-
-      await prisma.event.create({
-        data: {
-          attemptId: attempt.id,
-          type: "AUTO_FINISH_LIVES",
-          reason: "NO_LIVES_LEFT",
-          meta: null,
-        },
-      });
-    }
-
     return res.json({
       remaining,
       used,
       maxLives,
-      status: remaining === 0 ? "finished" : attempt.status,
+      status: updated.status,
     });
   } catch (e: any) {
     console.error("ANTIFRAUD_ERROR", e);
