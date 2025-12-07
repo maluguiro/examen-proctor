@@ -1304,8 +1304,33 @@ examsRouter.get("/attempts/:id/review", async (req, res) => {
     const gm = String(exam.gradingMode || "auto").toLowerCase();
     if (gm === "manual") gradingMode = "manual";
 
-    const canSee = gradingMode === "auto" && at.endAt != null;
-    if (!canSee) return res.status(403).json({ error: "REVIEW_NOT_AVAILABLE" });
+    const now = new Date();
+    const hasEnded = at.endAt != null;
+
+    // ¿la revisión ya está habilitada por fecha/hora?
+    let openAtOk = true;
+    if (exam.openAt instanceof Date) {
+      openAtOk = exam.openAt <= now;
+    }
+
+    const canSee = gradingMode === "auto" && hasEnded && openAtOk;
+
+    if (!canSee) {
+      // caso especial: corrección auto + intento terminado + openAt en el futuro
+      if (
+        gradingMode === "auto" &&
+        hasEnded &&
+        exam.openAt instanceof Date &&
+        exam.openAt > now
+      ) {
+        return res.status(403).json({
+          error: "¡Revision no habilitada aun!",
+          openAt: exam.openAt.toISOString(),
+        });
+      }
+
+      return res.status(403).json({ error: "REVIEW_NOT_AVAILABLE" });
+    }
 
     await ensureQuestionLite();
 
