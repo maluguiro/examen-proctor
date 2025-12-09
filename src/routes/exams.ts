@@ -1097,7 +1097,7 @@ examsRouter.get("/exams/:code/paper", async (req, res) => {
 
     const list: any[] = await prisma.$queryRawUnsafe(
       `
-      SELECT id, kind, stem, choices, points
+      SELECT id, kind, stem, choices, answer, points
       FROM "QuestionLite"
       WHERE examId = ?
       ORDER BY createdAt ASC
@@ -1112,7 +1112,18 @@ examsRouter.get("/exams/:code/paper", async (req, res) => {
       } catch {
         choices = null;
       }
-      // Mapeo mínimo viable a lo que espera el front s/[code]/page.tsx
+
+      // cuántos casilleros tiene (para FILL_IN)
+      let blanksCount = 0;
+      try {
+        const ans = q.answer ? JSON.parse(String(q.answer)) : null;
+        if (ans && Array.isArray(ans.answers)) {
+          blanksCount = ans.answers.length;
+        }
+      } catch {
+        blanksCount = 0;
+      }
+
       let kind: string = String(q.kind || "").toUpperCase();
       if (kind === "TEXT") kind = "SHORT";
       if (kind === "FILL_IN") kind = "FIB";
@@ -1123,6 +1134,8 @@ examsRouter.get("/exams/:code/paper", async (req, res) => {
         stem: q.stem,
         choices,
         points: q.points ?? 1,
+        // 👇 extra para el front (opcional)
+        blanksCount,
       };
     });
 
