@@ -63,8 +63,15 @@ function toExamResponse(exam: any) {
 /** Devuelve el objeto meta que espera el front en `/exams/:code/meta` */
 function toMetaResponse(exam: any) {
   if (!exam) return null;
+  const d = exam.durationMin ?? exam.durationMins ?? null;
+
   return {
     examId: exam.id,
+    code: exam.publicCode ?? exam.id.slice(0, 6),
+    title: exam.title ?? "(sin título)",
+    status: exam.status ?? "DRAFT",
+    durationMinutes: typeof d === "number" ? d : null,
+    lives: typeof exam.lives === "number" ? exam.lives : null,
     teacherName: exam.teacherName ?? null,
     subject: exam.subject ?? null,
     gradingMode:
@@ -76,6 +83,7 @@ function toMetaResponse(exam: any) {
         ? exam.maxScore
         : 0,
     openAt: exam.openAt ?? null,
+    closeAt: exam.endsAt ?? null,
   };
 }
 function formatDateTimeShort(value: any): string {
@@ -313,10 +321,10 @@ examsRouter.put("/exams/:code", async (req, res) => {
 examsRouter.get("/exams/:code/meta", async (req, res) => {
   try {
     const exam = await findExamByCode(req.params.code);
-    if (!exam) return res.status(404).json({ error: "EXAM_NOT_FOUND" });
+    if (!exam) return res.status(404).json({ error: "Exam not found" });
 
     const meta = toMetaResponse(exam);
-    return res.json({ meta });
+    return res.json(meta);
   } catch (e: any) {
     return res.status(500).json({ error: e?.message || String(e) });
   }
@@ -474,13 +482,13 @@ examsRouter.get("/exams/:code/activity.pdf", async (req, res) => {
     const events =
       attemptIds.length > 0
         ? await prisma.event.findMany({
-            where: { attemptId: { in: attemptIds } },
-            select: {
-              attemptId: true,
-              type: true,
-              reason: true,
-            },
-          })
+          where: { attemptId: { in: attemptIds } },
+          select: {
+            attemptId: true,
+            type: true,
+            reason: true,
+          },
+        })
         : [];
 
     const eventsByAttempt = new Map<
@@ -595,12 +603,11 @@ examsRouter.get("/exams/:code/activity.pdf", async (req, res) => {
           m.fromRole === "teacher"
             ? "Docente"
             : m.fromRole === "student"
-            ? "Alumno"
-            : String(m.fromRole || "");
+              ? "Alumno"
+              : String(m.fromRole || "");
         const broadcast = m.broadcast ? " · 📢 broadcast" : "";
-        const author = `${
-          m.authorName || "(sin nombre)"
-        } (${role}${broadcast})`;
+        const author = `${m.authorName || "(sin nombre)"
+          } (${role}${broadcast})`;
 
         doc.fontSize(11).text(`[${when}] ${author}`);
         doc.text(`   ${m.message}`);
@@ -1514,8 +1521,7 @@ examsRouter.post("/s/attempt/:id/event", async (req, res) => {
 examsRouter.get("/attempts/:id/review.print", async (req, res) => {
   try {
     const r = await fetch(
-      `http://localhost:${process.env.PORT || 3001}/api/attempts/${
-        req.params.id
+      `http://localhost:${process.env.PORT || 3001}/api/attempts/${req.params.id
       }/review`
     );
     if (!r.ok) {
