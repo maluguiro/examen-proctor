@@ -415,31 +415,69 @@ examsRouter.get("/exams/:code/attempts", async (req, res) => {
     const ids = attempts.map((a) => a.id);
     const events = await prisma.event.findMany({
       where: { attemptId: { in: ids } },
-      select: { attemptId: true, type: true, reason: true },
+      select: { attemptId: true, type: true, reason: true, ts: true },
+      orderBy: { ts: "asc" },
     });
 
-    const byAttempt = new Map<string, string[]>();
+    // Estructura intermedia para guardar la info procesada
+    interface AttemptViolations {
+      reasons: string[]; // para compatibilidad con lo anterior
+      count: number;
+      last: string | null;
+      typesMap: Map<string, number>;
+    }
+
+    const byAttempt = new Map<string, AttemptViolations>();
+
     for (const ev of events) {
-      const arr = byAttempt.get(ev.attemptId) ?? [];
-      arr.push(ev.reason || ev.type || "UNKNOWN");
-      byAttempt.set(ev.attemptId, arr);
+      if (!byAttempt.has(ev.attemptId)) {
+        byAttempt.set(ev.attemptId, {
+          reasons: [],
+          count: 0,
+          last: null,
+          typesMap: new Map(),
+        });
+      }
+      const data = byAttempt.get(ev.attemptId)!;
+      const r = ev.reason || ev.type || "UNKNOWN";
+
+      // Compatibilidad
+      data.reasons.push(r);
+
+      // Nuevos cálculos
+      data.count++;
+      data.last = r;
+
+      const rUpper = r.toUpperCase();
+      data.typesMap.set(rUpper, (data.typesMap.get(rUpper) ?? 0) + 1);
     }
 
     const out = attempts.map((a) => {
       const used = a.livesUsed ?? 0;
       const maxLives = exam.lives ?? 3;
       const remaining = Math.max(0, maxLives - used);
-      const vio = byAttempt.get(a.id) ?? [];
+
+      const vData = byAttempt.get(a.id);
+      const violationTypes: { type: string; count: number }[] = [];
+
+      if (vData) {
+        for (const [t, c] of vData.typesMap.entries()) {
+          violationTypes.push({ type: t, count: c });
+        }
+      }
 
       return {
         id: a.id,
         studentName: a.studentName || "(sin nombre)",
         livesRemaining: remaining,
         paused: !!a.paused,
-        status: a.status ?? "in_progress", // 👈 ahora el front tiene status
-        violations: JSON.stringify(vio),
+        status: a.status ?? "in_progress",
+        violations: JSON.stringify(vData?.reasons ?? []),
+        violationsCount: vData?.count ?? 0,
+        lastViolationReason: vData?.last ?? null,
+        violationTypes,
         startedAt: a.startAt ? a.startAt.toISOString() : null,
-        finishedAt: a.endAt ? a.endAt.toISOString() : null, // 👈 CLAVE
+        finishedAt: a.endAt ? a.endAt.toISOString() : null,
       };
     });
 
