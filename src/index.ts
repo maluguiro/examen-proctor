@@ -1,3 +1,4 @@
+// Servidor principal del sistema de exámenes con proctor antifraude.
 // api/src/index.ts
 import express from "express";
 import cors from "cors";
