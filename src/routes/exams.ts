@@ -424,6 +424,7 @@ examsRouter.get("/exams/:code/attempts", async (req, res) => {
       reasons: string[]; // para compatibilidad con lo anterior
       count: number;
       last: string | null;
+      lastTs: Date | null;
       typesMap: Map<string, number>;
     }
 
@@ -435,6 +436,7 @@ examsRouter.get("/exams/:code/attempts", async (req, res) => {
           reasons: [],
           count: 0,
           last: null,
+          lastTs: null,
           typesMap: new Map(),
         });
       }
@@ -447,6 +449,7 @@ examsRouter.get("/exams/:code/attempts", async (req, res) => {
       // Nuevos cálculos
       data.count++;
       data.last = r;
+      data.lastTs = ev.ts;
 
       const rUpper = r.toUpperCase();
       data.typesMap.set(rUpper, (data.typesMap.get(rUpper) ?? 0) + 1);
@@ -466,6 +469,13 @@ examsRouter.get("/exams/:code/attempts", async (req, res) => {
         }
       }
 
+      // Cálculo de lastActivityAt robusto
+      const tStart = a.startAt ? new Date(a.startAt).getTime() : 0;
+      const tEnd = a.endAt ? new Date(a.endAt).getTime() : 0;
+      const tEvent = vData?.lastTs ? new Date(vData.lastTs).getTime() : 0;
+
+      const maxTs = Math.max(tStart, tEnd, tEvent);
+
       return {
         id: a.id,
         studentName: a.studentName || "(sin nombre)",
@@ -476,6 +486,9 @@ examsRouter.get("/exams/:code/attempts", async (req, res) => {
         violationsCount: vData?.count ?? 0,
         lastViolationReason: vData?.last ?? null,
         violationTypes,
+        // Nuevo campo
+        lastActivityAt: maxTs > 0 ? new Date(maxTs).toISOString() : null,
+
         startedAt: a.startAt ? a.startAt.toISOString() : null,
         finishedAt: a.endAt ? a.endAt.toISOString() : null,
       };

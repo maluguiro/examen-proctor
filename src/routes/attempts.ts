@@ -58,6 +58,17 @@ attempts.post("/:id/events", async (req, res) => {
   });
   if (!attempt) return res.status(404).json({ error: "ATTEMPT_NOT_FOUND" });
 
+  // 🔹 NUEVO: Si el intento ya no está en progreso, ignoramos el evento
+  // para no descontar vidas ni registrar fraude post-entregado.
+  if (attempt.status !== "in_progress") {
+    return res.json({
+      livesLeft: attempt.lives,
+      status: attempt.status,
+      autoSubmitted: attempt.status === "SUBMITTED" || attempt.lives === 0,
+      ignored: true,
+    });
+  }
+
   const exam = await prisma.exam.findUnique({
     where: { id: attempt.examId },
     select: { lives: true, status: true },
