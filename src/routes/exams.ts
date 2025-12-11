@@ -409,6 +409,7 @@ examsRouter.get("/exams/:code/attempts", async (req, res) => {
         startAt: true,
         endAt: true,
         status: true,
+        score: true, // 👈 NUEVO: necesario para mostrar puntaje
       },
     });
 
@@ -480,6 +481,8 @@ examsRouter.get("/exams/:code/attempts", async (req, res) => {
         id: a.id,
         studentName: a.studentName || "(sin nombre)",
         livesRemaining: remaining,
+        livesUsed: a.livesUsed ?? 0, // 👈 Alineado con front
+        score: a.score ?? null,      // 👈 Alineado con front
         paused: !!a.paused,
         status: a.status ?? "in_progress",
         violations: JSON.stringify(vData?.reasons ?? []),
@@ -494,7 +497,16 @@ examsRouter.get("/exams/:code/attempts", async (req, res) => {
       };
     });
 
-    return res.json({ attempts: out });
+    return res.json({
+      exam: {
+        id: exam.id,
+        title: exam.title,
+        status: exam.status,
+        lives: exam.lives,
+        code: exam.publicCode ?? exam.id.slice(0, 6),
+      },
+      attempts: out,
+    });
   } catch (e: any) {
     return res.status(500).json({ error: e?.message || String(e) });
   }

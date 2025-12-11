@@ -13,6 +13,25 @@ model User {
   id    String @id @default(cuid())
   email String @unique
   role  String // 'teacher' | 'student'
+  
+  // Auth básica + Perfil
+  name         String?   // nombre visible
+  passwordHash String?
+  createdAt    DateTime  @default(now())
+
+  teacherProfile TeacherProfile?
+}
+
+model TeacherProfile {
+  id           String   @id @default(cuid())
+  userId       String   @unique
+  fullName     String
+  // Array de { id, name, kind?, subjects: [{ id, name }] }
+  institutions Json     
+  
+  user         User     @relation(fields: [userId], references: [id])
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 }
 
 model Exam {

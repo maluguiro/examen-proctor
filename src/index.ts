@@ -5,6 +5,11 @@ import cors from "cors";
 import "dotenv/config";
 import crypto from "crypto";
 
+// Importamos nuevas rutas
+import { authRouter } from "./routes/auth";
+import { teacherRouter } from "./routes/teacher";
+import { authMiddleware } from "./authMiddleware";
+
 import { examsRouter } from "./routes/exams";
 import { questionsRouter } from "./routes/questions";
 import { prisma } from "./prisma";
@@ -13,6 +18,10 @@ import { ExamStatus } from "@prisma/client";
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Montamos AUTH y TEACHER
+app.use("/api/auth", authRouter);
+app.use("/api/teacher", authMiddleware, teacherRouter);
 
 // ---- helpers para crear examen ----
 function randomCode(len = 6) {
