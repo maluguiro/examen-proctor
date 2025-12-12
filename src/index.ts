@@ -146,7 +146,6 @@ app.post("/api/exams", optionalAuthMiddleware, async (req, res) => {
     }
 
     // Campos adicionales (university, subject)
-    const university = body.userUniversity ? String(body.userUniversity).trim() : null;
     const subject = body.userSubject ? String(body.userSubject).trim() : null;
 
     const publicCode = await generateExamPublicCode();
@@ -160,7 +159,6 @@ app.post("/api/exams", optionalAuthMiddleware, async (req, res) => {
         durationMins: durationMin,
         ownerId,
         publicCode,
-        university,
         subject,
         teacherName, // se puede actualizar luego
       },

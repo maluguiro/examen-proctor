@@ -197,6 +197,34 @@ examsRouter.get("/exams", async (req, res) => {
 /* -------------------------------------------------------------------------- */
 
 /**
+ * GET /api/exams/by-code/:code
+ * Endpoint público para que el alumno busque examen por su código.
+ */
+examsRouter.get("/exams/by-code/:code", async (req, res) => {
+  try {
+    const exam = await findExamByCode(req.params.code);
+    if (!exam) {
+      return res.status(404).json({ error: "Exam not found" });
+    }
+
+    const d = (exam as any).durationMin ?? (exam as any).durationMins ?? null;
+
+    return res.json({
+      exam: {
+        id: exam.id,
+        title: exam.title ?? "(sin título)",
+        status: exam.status ?? "DRAFT",
+        durationMinutes: typeof d === "number" ? d : null,
+        lives: typeof (exam as any).lives === "number" ? (exam as any).lives : null,
+        code: exam.publicCode ?? exam.id.slice(0, 6),
+      },
+    });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || String(e) });
+  }
+});
+
+/**
  * GET /api/exams/:code
  * Devuelve la info básica del examen para la pantalla de configuración docente.
  */
