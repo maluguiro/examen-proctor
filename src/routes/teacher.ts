@@ -83,3 +83,40 @@ teacherRouter.put("/profile", async (req, res) => {
         return res.status(500).json({ error: err?.message || "INTERNAL_ERROR" });
     }
 });
+
+/**
+ * PATCH /api/teacher/profile
+ * Actualización parcial del perfil.
+ * Protegido por autenticación (userId en req.user).
+ */
+teacherRouter.patch("/profile", async (req, res) => {
+    try {
+        const userId = req.user?.userId;
+        if (!userId) return res.status(401).json({ error: "UNAUTHORIZED" });
+
+        const { fullName, institutions } = req.body;
+        const data: any = {};
+
+        if (fullName !== undefined) {
+            data.fullName = String(fullName).trim();
+        }
+        if (institutions !== undefined) {
+            // Validación básica de array
+            if (!Array.isArray(institutions)) {
+                return res.status(400).json({ error: "INSTITUTIONS_MUST_BE_ARRAY" });
+            }
+            data.institutions = institutions;
+        }
+
+        // Se asume que el perfil existe (creado al registrarse o en GET previo)
+        const updated = await prisma.teacherProfile.update({
+            where: { userId },
+            data,
+        });
+
+        return res.json({ profile: updated });
+    } catch (err: any) {
+        console.error("PATCH_PROFILE_ERROR", err);
+        return res.status(500).json({ error: err?.message || "INTERNAL_ERROR" });
+    }
+});
