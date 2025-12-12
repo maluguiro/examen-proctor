@@ -120,3 +120,42 @@ teacherRouter.patch("/profile", async (req, res) => {
         return res.status(500).json({ error: err?.message || "INTERNAL_ERROR" });
     }
 });
+
+/**
+ * GET /api/teacher/exams
+ * Lista los exámenes creados por el docente logueado.
+ */
+teacherRouter.get("/exams", async (req, res) => {
+    try {
+        const userId = req.user?.userId;
+        if (!userId) return res.status(401).json({ error: "UNAUTHORIZED" });
+
+        const exams = await prisma.exam.findMany({
+            where: { ownerId: userId },
+            orderBy: { createdAt: "desc" },
+        });
+
+        const shaped = exams.map((e) => {
+            const durationRaw = e.durationMin ?? e.durationMins ?? null;
+            const durationMinutes = typeof durationRaw === "number" ? durationRaw : null;
+            return {
+                id: e.id,
+                title: e.title,
+                status: e.status,
+                createdAt: e.createdAt,
+                code: e.publicCode ?? e.id.slice(0, 6),
+                durationMinutes,
+                lives: e.lives,
+                // Campos nuevos
+                university: e.university,
+                subject: e.subject,
+                teacherName: e.teacherName,
+            };
+        });
+
+        return res.json({ exams: shaped });
+    } catch (err: any) {
+        console.error("GET_TEACHER_EXAMS_ERROR", err);
+        return res.status(500).json({ error: err?.message || "INTERNAL_ERROR" });
+    }
+});

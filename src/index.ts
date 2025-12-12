@@ -8,7 +8,7 @@ import crypto from "crypto";
 // Importamos nuevas rutas
 import { authRouter } from "./routes/auth";
 import { teacherRouter } from "./routes/teacher";
-import { authMiddleware } from "./authMiddleware";
+import { authMiddleware, optionalAuthMiddleware } from "./authMiddleware";
 
 import { examsRouter } from "./routes/exams";
 import { questionsRouter } from "./routes/questions";
@@ -107,8 +107,9 @@ app.get("/api/exams", async (_req, res) => {
 });
 // ✅ CREAR EXAMEN
 //    POST /api/exams
-//    body: { title, lives?, durationMinutes? }
-app.post("/api/exams", async (req, res) => {
+//    body: { title, lives?, durationMinutes?, userSubject?, userUniversity? }
+//    Ahora soporta AUTH OPCIONAL. Si hay token, usa el userId como ownerId.
+app.post("/api/exams", optionalAuthMiddleware, async (req, res) => {
   try {
     const body = req.body ?? {};
 
@@ -134,7 +135,20 @@ app.post("/api/exams", async (req, res) => {
         ? null
         : Math.max(0, Math.floor(Number(rawDuration) || 0));
 
-    const ownerId = process.env.DEFAULT_OWNER_ID || "docente-local";
+    // Auth: Si hay usuario logueado, lo usamos como owner
+    let ownerId = process.env.DEFAULT_OWNER_ID || "docente-local";
+    let teacherName: string | null = null;
+
+    if (req.user?.userId) {
+      ownerId = req.user.userId;
+      // Intentar obtener nombre si lo tenemos a mano, o dejarlo null para que el perfil lo controle
+      // Podríamos buscar el perfil, pero por performance quizás baste con lo que venga en el body o default
+    }
+
+    // Campos adicionales (university, subject)
+    const university = body.userUniversity ? String(body.userUniversity).trim() : null;
+    const subject = body.userSubject ? String(body.userSubject).trim() : null;
+
     const publicCode = await generateExamPublicCode();
 
     const exam = await prisma.exam.create({
@@ -146,6 +160,9 @@ app.post("/api/exams", async (req, res) => {
         durationMins: durationMin,
         ownerId,
         publicCode,
+        university,
+        subject,
+        teacherName, // se puede actualizar luego
       },
     });
 
