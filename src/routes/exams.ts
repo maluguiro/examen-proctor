@@ -215,7 +215,8 @@ examsRouter.get("/exams/by-code/:code", async (req, res) => {
         title: exam.title ?? "(sin título)",
         status: exam.status ?? "DRAFT",
         durationMinutes: typeof d === "number" ? d : null,
-        lives: typeof (exam as any).lives === "number" ? (exam as any).lives : null,
+        lives:
+          typeof (exam as any).lives === "number" ? (exam as any).lives : null,
         code: exam.publicCode ?? exam.id.slice(0, 6),
       },
     });
@@ -510,7 +511,7 @@ examsRouter.get("/exams/:code/attempts", async (req, res) => {
         studentName: a.studentName || "(sin nombre)",
         livesRemaining: remaining,
         livesUsed: a.livesUsed ?? 0, // 👈 Alineado con front
-        score: a.score ?? null,      // 👈 Alineado con front
+        score: a.score ?? null, // 👈 Alineado con front
         paused: !!a.paused,
         status: a.status ?? "in_progress",
         violations: JSON.stringify(vData?.reasons ?? []),
@@ -573,13 +574,13 @@ examsRouter.get("/exams/:code/activity.pdf", async (req, res) => {
     const events =
       attemptIds.length > 0
         ? await prisma.event.findMany({
-          where: { attemptId: { in: attemptIds } },
-          select: {
-            attemptId: true,
-            type: true,
-            reason: true,
-          },
-        })
+            where: { attemptId: { in: attemptIds } },
+            select: {
+              attemptId: true,
+              type: true,
+              reason: true,
+            },
+          })
         : [];
 
     const eventsByAttempt = new Map<
@@ -694,11 +695,12 @@ examsRouter.get("/exams/:code/activity.pdf", async (req, res) => {
           m.fromRole === "teacher"
             ? "Docente"
             : m.fromRole === "student"
-              ? "Alumno"
-              : String(m.fromRole || "");
+            ? "Alumno"
+            : String(m.fromRole || "");
         const broadcast = m.broadcast ? " · 📢 broadcast" : "";
-        const author = `${m.authorName || "(sin nombre)"
-          } (${role}${broadcast})`;
+        const author = `${
+          m.authorName || "(sin nombre)"
+        } (${role}${broadcast})`;
 
         doc.fontSize(11).text(`[${when}] ${author}`);
         doc.text(`   ${m.message}`);
@@ -1514,6 +1516,63 @@ examsRouter.get("/attempts/:id/review", async (req, res) => {
     return res.status(500).json({ error: e?.message || String(e) });
   }
 });
+// DELETE /api/exams/:id
+// Elimina un examen y todas sus dependencias (attempts, answers, events, messages, questions)
+examsRouter.delete("/exams/:id", async (req, res) => {
+  const examId = req.params.id;
+
+  try {
+    const exam = await prisma.exam.findUnique({
+      where: { id: examId },
+    });
+
+    if (!exam) {
+      return res.status(404).json({ error: "EXAM_NOT_FOUND" });
+    }
+
+    // 1) Traer IDs de intentos de ese examen
+    const attempts = await prisma.attempt.findMany({
+      where: { examId },
+      select: { id: true },
+    });
+    const attemptIds = attempts.map((a) => a.id);
+
+    // 2) Borrar dependencias de los intentos (answers, events, messages)
+    if (attemptIds.length > 0) {
+      await prisma.answer.deleteMany({
+        where: { attemptId: { in: attemptIds } },
+      });
+
+      await prisma.event.deleteMany({
+        where: { attemptId: { in: attemptIds } },
+      });
+
+      await prisma.message.deleteMany({
+        where: { attemptId: { in: attemptIds } },
+      });
+
+      await prisma.attempt.deleteMany({
+        where: { id: { in: attemptIds } },
+      });
+    }
+
+    // 3) Borrar preguntas del examen
+    await prisma.question.deleteMany({
+      where: { examId },
+    });
+
+    // 4) Finalmente borrar el examen
+    await prisma.exam.delete({
+      where: { id: examId },
+    });
+
+    return res.json({ ok: true });
+  } catch (e: any) {
+    console.error("DELETE_EXAM_ERROR", e);
+    return res.status(500).json({ error: e?.message || "DELETE_EXAM_ERROR" });
+  }
+});
+
 /**
  * POST /api/s/attempt/:id/event
  * Body: { type, meta? }
@@ -1612,7 +1671,8 @@ examsRouter.post("/s/attempt/:id/event", async (req, res) => {
 examsRouter.get("/attempts/:id/review.print", async (req, res) => {
   try {
     const r = await fetch(
-      `http://localhost:${process.env.PORT || 3001}/api/attempts/${req.params.id
+      `http://localhost:${process.env.PORT || 3001}/api/attempts/${
+        req.params.id
       }/review`
     );
     if (!r.ok) {
