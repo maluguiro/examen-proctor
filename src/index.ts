@@ -139,6 +139,14 @@ app.post("/api/exams", optionalAuthMiddleware, async (req, res) => {
     let ownerId = process.env.DEFAULT_OWNER_ID || "docente-local";
     let teacherName: string | null = null;
 
+    // Auth: Si hay usuario logueado, lo usamos como owner (PRIORIDAD AL TOKEN)
+    if (req.user?.userId) {
+      ownerId = req.user.userId;
+    }
+
+    // Si NO hay token (caso opcional), ownerId queda como default o lo que venga (si permitimos suplantación, pero mejor priorizar seguridad)
+    // Para este fix, nos aseguramos que si hay user, se use.
+
     if (req.user?.userId) {
       ownerId = req.user.userId;
       // Intentar obtener nombre si lo tenemos a mano, o dejarlo null para que el perfil lo controle
@@ -157,10 +165,10 @@ app.post("/api/exams", optionalAuthMiddleware, async (req, res) => {
         lives,
         durationMin,
         durationMins: durationMin,
-        ownerId,
+        ownerId: ownerId ?? process.env.DEFAULT_OWNER_ID ?? "docente-local",
         publicCode,
         subject,
-        teacherName, // se puede actualizar luego
+        teacherName,
       },
     });
 

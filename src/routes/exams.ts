@@ -3,9 +3,103 @@
 import { Router } from "express";
 import { prisma } from "../prisma";
 import crypto from "crypto";
-import PDFDocument from "pdfkit"; // 👈 NUEVO
+import PDFDocument from "pdfkit";
+import { authMiddleware } from "../authMiddleware"; // Necesario para asegurar user en request si se usa en rutas protegidas explícitas
 
 export const examsRouter = Router();
+
+/* -------------------------------------------------------------------------- */
+/*                        MODIFICACIÓN DE INTENTOS (DOCENTE)                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * POST /api/attempts/:id/mod
+ * Mofidica estado de un intento: pausa, vida, tiempo extra.
+ * SEGURIDAD: Solo el dueño del examen puede tocar esto.
+ */
+examsRouter.post("/attempts/:id/mod", authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const { action, seconds } = req.body || {};
+  const userId = req.user?.userId; // Garantizado por authMiddleware
+
+  console.log("MOD_ATTEMPT", { attemptId: id, userId, action });
+
+  try {
+    // 1. Buscar intento y validar que el examen sea del usuario logueado
+    const attempt = await prisma.attempt.findFirst({
+      where: {
+        id,
+        exam: {
+          ownerId: userId, // 🔒 SEGURIDAD CRÍTICA
+        },
+      },
+      include: { exam: true },
+    });
+
+    if (!attempt) {
+      console.warn("MOD_ATTEMPT_NOT_FOUND", { attemptId: id, userId });
+      return res.status(404).json({ error: "ATTEMPT_NOT_FOUND_OR_FORBIDDEN" });
+    }
+
+    const data: any = {};
+    const maxLives = attempt.exam.lives ?? 3;
+
+    // 2. Aplicar acción
+    switch (action) {
+      case "forgive_life": {
+        // Restar livesUsed (equivale a devolver una vida)
+        // No puede ser menor a 0
+        const current = attempt.livesUsed ?? 0;
+        data.livesUsed = Math.max(0, current - 1);
+        break;
+      }
+
+      case "add_time": {
+        // Sumar segundos a extraTimeSecs
+        const toAdd = Number(seconds);
+        if (!isNaN(toAdd) && toAdd > 0) {
+          data.extraTimeSecs = (attempt.extraTimeSecs ?? 0) + toAdd;
+        }
+        break;
+      }
+
+      case "pause": {
+        data.paused = true;
+        break;
+      }
+
+      case "resume": {
+        data.paused = false;
+        break;
+      }
+
+      default:
+        return res.status(400).json({ error: "INVALID_ACTION" });
+    }
+
+    // 3. Guardar cambios
+    const updated = await prisma.attempt.update({
+      where: { id },
+      data,
+    });
+
+    // Calcular remaining para devolver al front si hace falta (aunque el front suele recargar)
+    const remaining = Math.max(0, maxLives - (updated.livesUsed ?? 0));
+
+    return res.json({
+      ok: true,
+      attempt: {
+        ...updated,
+        livesRemaining: remaining
+      }
+    });
+
+  } catch (e: any) {
+    console.error("MOD_ATTEMPT_ERROR", e);
+    return res.status(500).json({ error: e?.message || "INTERNAL_ERROR" });
+  }
+});
+
 
 /* --------------------------------- HELPERS -------------------------------- */
 
@@ -574,13 +668,13 @@ examsRouter.get("/exams/:code/activity.pdf", async (req, res) => {
     const events =
       attemptIds.length > 0
         ? await prisma.event.findMany({
-            where: { attemptId: { in: attemptIds } },
-            select: {
-              attemptId: true,
-              type: true,
-              reason: true,
-            },
-          })
+          where: { attemptId: { in: attemptIds } },
+          select: {
+            attemptId: true,
+            type: true,
+            reason: true,
+          },
+        })
         : [];
 
     const eventsByAttempt = new Map<
@@ -695,12 +789,11 @@ examsRouter.get("/exams/:code/activity.pdf", async (req, res) => {
           m.fromRole === "teacher"
             ? "Docente"
             : m.fromRole === "student"
-            ? "Alumno"
-            : String(m.fromRole || "");
+              ? "Alumno"
+              : String(m.fromRole || "");
         const broadcast = m.broadcast ? " · 📢 broadcast" : "";
-        const author = `${
-          m.authorName || "(sin nombre)"
-        } (${role}${broadcast})`;
+        const author = `${m.authorName || "(sin nombre)"
+          } (${role}${broadcast})`;
 
         doc.fontSize(11).text(`[${when}] ${author}`);
         doc.text(`   ${m.message}`);
@@ -1671,8 +1764,7 @@ examsRouter.post("/s/attempt/:id/event", async (req, res) => {
 examsRouter.get("/attempts/:id/review.print", async (req, res) => {
   try {
     const r = await fetch(
-      `http://localhost:${process.env.PORT || 3001}/api/attempts/${
-        req.params.id
+      `http://localhost:${process.env.PORT || 3001}/api/attempts/${req.params.id
       }/review`
     );
     if (!r.ok) {
