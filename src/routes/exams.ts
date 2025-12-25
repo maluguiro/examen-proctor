@@ -90,16 +90,14 @@ examsRouter.post("/attempts/:id/mod", authMiddleware, async (req, res) => {
       ok: true,
       attempt: {
         ...updated,
-        livesRemaining: remaining
-      }
+        livesRemaining: remaining,
+      },
     });
-
   } catch (e: any) {
     console.error("MOD_ATTEMPT_ERROR", e);
     return res.status(500).json({ error: e?.message || "INTERNAL_ERROR" });
   }
 });
-
 
 /* --------------------------------- HELPERS -------------------------------- */
 
@@ -668,13 +666,13 @@ examsRouter.get("/exams/:code/activity.pdf", async (req, res) => {
     const events =
       attemptIds.length > 0
         ? await prisma.event.findMany({
-          where: { attemptId: { in: attemptIds } },
-          select: {
-            attemptId: true,
-            type: true,
-            reason: true,
-          },
-        })
+            where: { attemptId: { in: attemptIds } },
+            select: {
+              attemptId: true,
+              type: true,
+              reason: true,
+            },
+          })
         : [];
 
     const eventsByAttempt = new Map<
@@ -789,11 +787,12 @@ examsRouter.get("/exams/:code/activity.pdf", async (req, res) => {
           m.fromRole === "teacher"
             ? "Docente"
             : m.fromRole === "student"
-              ? "Alumno"
-              : String(m.fromRole || "");
+            ? "Alumno"
+            : String(m.fromRole || "");
         const broadcast = m.broadcast ? " · 📢 broadcast" : "";
-        const author = `${m.authorName || "(sin nombre)"
-          } (${role}${broadcast})`;
+        const author = `${
+          m.authorName || "(sin nombre)"
+        } (${role}${broadcast})`;
 
         doc.fontSize(11).text(`[${when}] ${author}`);
         doc.text(`   ${m.message}`);
@@ -1764,7 +1763,8 @@ examsRouter.post("/s/attempt/:id/event", async (req, res) => {
 examsRouter.get("/attempts/:id/review.print", async (req, res) => {
   try {
     const r = await fetch(
-      `http://localhost:${process.env.PORT || 3001}/api/attempts/${req.params.id
+      `http://localhost:${process.env.PORT || 3001}/api/attempts/${
+        req.params.id
       }/review`
     );
     if (!r.ok) {
