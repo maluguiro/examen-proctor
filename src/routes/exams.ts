@@ -1755,101 +1755,786 @@ examsRouter.post("/s/attempt/:id/event", async (req, res) => {
     return res.status(500).json({ error: e?.message || "ANTIFRAUD_ERROR" });
   }
 });
-
-/**
- * GET /api/attempts/:id/review.print
- * Versión HTML simple para imprimir/guardar como PDF.
- */
+// GET /api/attempts/:id/review.print
+// Versión HTML estilizada para imprimir/guardar como PDF.
 examsRouter.get("/attempts/:id/review.print", async (req, res) => {
   try {
-    const r = await fetch(
-      `http://localhost:${process.env.PORT || 3001}/api/attempts/${
-        req.params.id
-      }/review`
-    );
+    const base = `http://localhost:${process.env.PORT || 3001}`;
+    const r = await fetch(`${base}/api/attempts/${req.params.id}/review`);
+
     if (!r.ok) {
       const text = await r.text();
       return res.status(r.status).send(text);
     }
 
-    const data: any = await r.json();
+    const data = await r.json();
+    const attempt = data.attempt || {};
+    const exam = data.exam || {};
+    const questions: any[] = Array.isArray(data.questions)
+      ? data.questions
+      : [];
 
-    const esc = (s: any) =>
-      String(s ?? "").replace(/[&<>"]/g, (c) => {
-        return (
-          {
-            "&": "&",
-            "<": "<",
-            ">": ">",
-            '"': '"',
-          } as any
-        )[c];
+    // --- Helpers básicos ----------------------------------------------
+
+    const esc = (v: any) =>
+      String(v ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+
+    const formatDateTime = (raw: any) => {
+      if (!raw) return "-";
+      const d = new Date(raw);
+      if (Number.isNaN(d.getTime())) return "-";
+      return d.toLocaleString("es-AR", {
+        day: "2-digit",
+        month: "2-digit",
+        year: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
       });
+    };
 
-    const started = new Date(data.attempt.startedAt);
-    const finished = data.attempt.finishedAt
-      ? new Date(data.attempt.finishedAt)
-      : null;
-    const diffMs = finished ? finished.getTime() - started.getTime() : 0;
-    const mins = Math.floor(diffMs / 60000);
-    const secs = Math.floor((diffMs % 60000) / 1000);
+    function formatDuration(totalSeconds: number | null | undefined): string {
+      if (totalSeconds == null || !Number.isFinite(totalSeconds)) return "-";
+      const secs = Math.max(0, Math.round(totalSeconds));
+      const hours = Math.floor(secs / 3600);
+      const minutes = Math.floor((secs % 3600) / 60);
+      const seconds = secs % 60;
 
-    const header = `
-Alumno: ${esc(data.attempt.studentName)}
+      const parts: string[] = [];
+      if (hours > 0) parts.push(`${hours} hora${hours !== 1 ? "s" : ""}`);
+      if (minutes > 0)
+        parts.push(`${minutes} minuto${minutes !== 1 ? "s" : ""}`);
+      if (hours === 0 && seconds > 0) {
+        // Solo mostramos segundos si no hubo horas
+        parts.push(`${seconds} segundo${seconds !== 1 ? "s" : ""}`);
+      }
 
-Comenzado el: ${esc(started.toLocaleString())}
+      return parts.length ? parts.join(" ") : "0 segundos";
+    }
 
-Estado: ${finished ? "Finalizado" : "En curso"}
+    const startedAt =
+      attempt.startedAt ||
+      attempt.started_at ||
+      attempt.startedAtUtc ||
+      attempt.startTime;
+    const finishedAt =
+      attempt.finishedAt ||
+      attempt.finished_at ||
+      attempt.finishedAtUtc ||
+      attempt.endTime;
 
-Finalizado en: ${finished ? esc(finished.toLocaleString()) : "-"}
+    let durationSeconds: number | null =
+      attempt.durationSeconds ??
+      attempt.secondsTaken ??
+      attempt.timeTakenSeconds ??
+      null;
 
-Tiempo empleado: ${finished ? `${mins} min ${secs} s` : "-"}
+    if (durationSeconds == null && startedAt && finishedAt) {
+      const diff =
+        (new Date(finishedAt).getTime() - new Date(startedAt).getTime()) / 1000;
+      if (Number.isFinite(diff) && diff >= 0) {
+        durationSeconds = Math.round(diff);
+      }
+    }
 
-Puntos: ${data.attempt.score ?? "-"} / ${data.attempt.maxScore}
-`;
+    const totalScore =
+      attempt.totalScore ?? attempt.score ?? data.totalScore ?? data.score ?? 0;
+    const maxScore =
+      attempt.maxScore ?? data.maxScore ?? data.maxPoints ?? data.points ?? 0;
 
-    const body = data.questions
-      .map((q: any, i: number) => {
-        const num = i + 1;
+    // --- Helpers específicos para FIB ---------------------------------
+
+    // Convierte "algo" en un array de strings (sirve para FIB)
+    function extractAnswersArray(raw: any): string[] {
+      if (!raw) return [];
+
+      if (Array.isArray(raw)) {
+        return raw.map((v) => String(v ?? ""));
+      }
+
+      if (typeof raw === "object") {
+        if (Array.isArray((raw as any).answers)) {
+          return (raw as any).answers.map((v: any) => String(v ?? ""));
+        }
+        if (Array.isArray((raw as any).values)) {
+          return (raw as any).values.map((v: any) => String(v ?? ""));
+        }
+      }
+
+      if (typeof raw === "string" && raw.trim().length > 0) {
+        return [raw.trim()];
+      }
+
+      return [];
+    }
+
+    // Busca en cualquier propiedad-objeto del ítem algo con .answers[]
+    function findNestedAnswersArray(
+      obj: any,
+      excludeKeys: string[] = []
+    ): string[] {
+      if (!obj || typeof obj !== "object") return [];
+
+      for (const [key, value] of Object.entries(obj)) {
+        if (excludeKeys.includes(key)) continue;
+        if (
+          value &&
+          typeof value === "object" &&
+          Array.isArray((value as any).answers)
+        ) {
+          return (value as any).answers.map((v: any) => String(v ?? ""));
+        }
+      }
+
+      return [];
+    }
+    const CORRECT_KEYS = new Set([
+      "correct",
+      "correctAnswers",
+      "correctAnswer",
+      "solution",
+      "expected",
+      "key",
+    ]);
+
+    // Intenta encontrar "la respuesta del alumno" en muchas formas posibles
+    function extractStudentValue(q: any): any {
+      const directKeys = [
+        "studentAnswer",
+        "studentAnswers",
+        "student",
+        "given",
+        "answer",
+        "selected",
+        "value",
+        "response",
+        "choice",
+      ];
+
+      // 1) Claves directas en la raíz del objeto
+      for (const key of directKeys) {
+        if (Object.prototype.hasOwnProperty.call(q, key)) {
+          const v = (q as any)[key];
+          if (v !== undefined && v !== null) return v;
+        }
+      }
+
+      // 2) Buscar en sub-objetos (pero sin meternos en "correct", "solution", etc.)
+      for (const [key, value] of Object.entries(q)) {
+        if (CORRECT_KEYS.has(key)) continue;
+        if (!value || typeof value !== "object") continue;
+
+        const obj = value as any;
+
+        if (obj.student != null) return obj.student;
+        if (obj.answer != null) return obj.answer;
+        if (obj.value != null) return obj.value;
+        if (Array.isArray(obj.answers)) return obj.answers;
+      }
+
+      return null;
+    }
+
+    function extractFibStudentAnswers(q: any): string[] {
+      // 1) Candidatos directos
+      const candidates = [
+        q.studentAnswers,
+        q.studentAnswer,
+        q.answer,
+        q.student,
+        q.given,
+      ];
+
+      for (const c of candidates) {
+        const arr = extractAnswersArray(c);
+        if (arr.length) return arr;
+      }
+
+      // 2) Intenta usar el helper genérico
+      const generic = extractStudentValue(q);
+      const genericArr = extractAnswersArray(generic);
+      if (genericArr.length) return genericArr;
+
+      // 3) Fallback: cualquier objeto con .answers dentro de la pregunta,
+      // excluyendo los típicos de "correctas"
+      const nested = findNestedAnswersArray(q, Array.from(CORRECT_KEYS));
+      if (nested.length) return nested;
+
+      return [];
+    }
+
+    function extractFibCorrectAnswers(q: any): string[] {
+      // 1) Candidatos directos
+      const candidates = [
+        q.correctAnswers,
+        q.correctAnswer,
+        q.solution,
+        q.expected,
+        q.key,
+        q.correctValue,
+        q.correct,
+      ];
+
+      for (const c of candidates) {
+        const arr = extractAnswersArray(c);
+        if (arr.length) return arr;
+      }
+
+      // 2) Fallback: dentro de q.correct si es un objeto
+      if (q.correct && typeof q.correct === "object") {
+        const nested = findNestedAnswersArray(q.correct);
+        if (nested.length) return nested;
+      }
+
+      return [];
+    }
+
+    function isFibQuestion(q: any): boolean {
+      const kind = String(q.kind || q.type || "").toUpperCase();
+      if (kind === "FIB" || kind === "FILL_IN") return true;
+
+      if (
+        Array.isArray(q.correctAnswers) ||
+        (q.correct &&
+          typeof q.correct === "object" &&
+          (q.correct as any).answers)
+      ) {
+        return true;
+      }
+
+      return false;
+    }
+
+    function renderFibStem(
+      stem: string,
+      studentArr: string[],
+      correctArr: string[]
+    ): string {
+      if (!stem) return "";
+
+      const re = /\[\[(\d+)\]\]/g;
+      let lastIndex = 0;
+      let match: RegExpExecArray | null;
+      let html = "";
+
+      while ((match = re.exec(stem)) !== null) {
+        const idx = parseInt(match[1], 10) - 1; // [[1]] -> index 0
+        if (match.index > lastIndex) {
+          html += esc(stem.slice(lastIndex, match.index));
+        }
+
+        const studentVal = studentArr[idx] ?? "";
+        const correctVal = correctArr[idx] ?? "";
+
+        const trimmed = studentVal.trim();
+        const hasAnswer = trimmed.length > 0;
+        const isCorrect = hasAnswer && trimmed === correctVal;
+
+        let cls = "fib-chip-empty";
+        if (hasAnswer && isCorrect) cls = "fib-chip-correct";
+        else if (hasAnswer && !isCorrect) cls = "fib-chip-wrong";
+
+        const label = hasAnswer ? esc(trimmed) : "_____";
+
+        html += `<span class="fib-chip ${cls}">${label}</span>`;
+
+        lastIndex = match.index + match[0].length;
+      }
+
+      if (lastIndex < stem.length) {
+        html += esc(stem.slice(lastIndex));
+      }
+
+      return html;
+    }
+
+    function renderQuestionBadge(q: any): string {
+      if (isFibQuestion(q)) {
+        const studentArr = extractFibStudentAnswers(q);
+        const correctArr = extractFibCorrectAnswers(q);
+
+        const hasAny = studentArr.some((v) => v && v.trim().length > 0);
+
+        const allCorrect =
+          hasAny &&
+          studentArr.length === correctArr.length &&
+          studentArr.every((v, i) => v === (correctArr[i] ?? ""));
+
+        if (allCorrect) {
+          return `<span class="badge badge-correct">Respuesta correcta</span>`;
+        }
+        if (hasAny) {
+          return `<span class="badge badge-wrong">Respuesta incorrecta</span>`;
+        }
+        return `<span class="badge badge-empty">Sin respuesta</span>`;
+      }
+
+      // No-FIB: usamos flags del backend
+      if (q.correct === true || q.isCorrect === true) {
+        return `<span class="badge badge-correct">Respuesta correcta</span>`;
+      }
+      if (q.correct === false || q.isCorrect === false) {
+        return `<span class="badge badge-wrong">Respuesta incorrecta</span>`;
+      }
+      return `<span class="badge badge-empty">Sin respuesta</span>`;
+    }
+
+    function renderQuestionCard(q: any, index: number): string {
+      const stem = esc(q.stem || q.text || "");
+      const points =
+        q.points ?? q.score ?? q.maxPoints ?? q.maxScore ?? q.value ?? 1;
+
+      // FIB
+      if (isFibQuestion(q)) {
+        const studentArr = extractFibStudentAnswers(q);
+        const correctArr = extractFibCorrectAnswers(q);
+
+        const studentText = studentArr
+          .filter((v) => v && v.trim().length > 0)
+          .join(" / ");
+        const correctText = correctArr.join(" / ");
+
+        const hasAnyAnswer = studentText.length > 0;
+
+        const fibStemHtml = renderFibStem(q.stem || "", studentArr, correctArr);
+
         return `
-Pregunta ${num}
-${esc(q.stem)}
+          <section class="question">
+            <header class="question-header">
+              <div>
+                <div class="question-title">Pregunta ${index}</div>
+                <div class="question-points">${
+                  points === 1 ? "1 punto" : `${points} puntos`
+                }</div>
+              </div>
+              <div class="question-badge">
+                ${renderQuestionBadge(q)}
+              </div>
+            </header>
 
-Puntos: ${q.points ?? 1}
-Tu respuesta: ${esc(
-          typeof q.given === "string"
-            ? q.given
-            : JSON.stringify(q.given ?? null)
-        )}
-Correcta: ${esc(
-          typeof q.correct === "string"
-            ? q.correct
-            : JSON.stringify(q.correct ?? null)
-        )}
+            <div class="question-stem">
+              ${fibStemHtml || stem}
+            </div>
 
-`;
-      })
+            <div class="answer-row">
+              <div class="answer-label">Tu respuesta</div>
+              <div class="answer-value">
+                ${
+                  hasAnyAnswer
+                    ? esc(studentText)
+                    : '<span class="answer-empty">Sin respuesta</span>'
+                }
+              </div>
+            </div>
+
+            <div class="answer-row">
+              <div class="answer-label">Respuestas correctas</div>
+              <div class="answer-value">
+                ${
+                  correctText
+                    ? esc(correctText)
+                    : '<span class="answer-empty">Sin respuesta</span>'
+                }
+              </div>
+            </div>
+          </section>
+        `;
+      }
+
+      // Preguntas NO FIB
+      const rawStudent = extractStudentValue(q);
+      const correctAnswer =
+        q.correctAnswer ??
+        q.correctAnswers ??
+        q.solution ??
+        q.expected ??
+        q.key ??
+        q.correct ??
+        null;
+
+      const studentText =
+        rawStudent == null ||
+        (typeof rawStudent === "string" && rawStudent.trim() === "")
+          ? '<span class="answer-empty">Sin respuesta</span>'
+          : esc(
+              Array.isArray(rawStudent)
+                ? rawStudent.join(" / ")
+                : String(rawStudent)
+            );
+
+      const correctText =
+        correctAnswer == null || correctAnswer === ""
+          ? '<span class="answer-empty">Sin respuesta</span>'
+          : esc(
+              Array.isArray(correctAnswer)
+                ? correctAnswer.join(" / ")
+                : String(correctAnswer)
+            );
+
+      return `
+        <section class="question">
+          <header class="question-header">
+            <div>
+              <div class="question-title">Pregunta ${index}</div>
+              <div class="question-points">${
+                points === 1 ? "1 punto" : `${points} puntos`
+              }</div>
+            </div>
+            <div class="question-badge">
+              ${renderQuestionBadge(q)}
+            </div>
+          </header>
+
+          <div class="question-stem">
+            ${stem}
+          </div>
+
+          <div class="answer-row">
+            <div class="answer-label">Tu respuesta</div>
+            <div class="answer-value">${studentText}</div>
+          </div>
+
+          <div class="answer-row">
+            <div class="answer-label">Respuesta correcta</div>
+            <div class="answer-value">${correctText}</div>
+          </div>
+        </section>
+      `;
+    }
+
+    // --- HTML principal ------------------------------------------------
+
+    const studentName =
+      attempt.studentName || attempt.student || attempt.name || "Alumno";
+
+    const statusRaw =
+      attempt.status || attempt.state || (attempt.finishedAt ? "finished" : "");
+    const statusLabel =
+      String(statusRaw).toLowerCase() === "finished" ||
+      String(statusRaw).toLowerCase() === "finalized" ||
+      finishedAt
+        ? "Finalizado"
+        : "En curso";
+
+    const durationLabel = formatDuration(durationSeconds);
+
+    const htmlQuestions = questions
+      .map((q, idx) => renderQuestionCard(q, idx + 1))
       .join("");
 
-    const html = `
-<!DOCTYPE html>
-<html>
+    const html = `<!DOCTYPE html>
+<html lang="es">
 <head>
   <meta charset="utf-8" />
-  <title>Revisión — ${esc(data.exam.title)}</title>
+  <title>Revisión — ${esc(exam.title || "Examen")}</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 32px 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: radial-gradient(circle at top left, #e9ffe4 0, #f7fbe9 40%, #fdfdfd 100%);
+      color: #111827;
+    }
+    .page {
+      max-width: 900px;
+      margin: 0 auto;
+      background: rgba(255,255,255,0.96);
+      border-radius: 24px;
+      box-shadow: 0 18px 50px rgba(15, 118, 110, 0.08);
+      padding: 32px 40px 40px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 28px;
+      font-weight: 800;
+      color: #111827;
+    }
+    .subtitle {
+      font-size: 14px;
+      color: #6b7280;
+      margin-bottom: 24px;
+    }
+    .student-name {
+      font-weight: 700;
+      color: #059669;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .header-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    .summary-card {
+      flex: 1;
+      background: linear-gradient(135deg, #fefce8, #ecfccb);
+      border-radius: 20px;
+      padding: 16px 20px;
+      display: grid;
+      grid-template-columns: 1.3fr 1.1fr;
+      gap: 12px 24px;
+      font-size: 13px;
+      color: #374151;
+    }
+    .summary-label {
+      text-transform: uppercase;
+      font-size: 11px;
+      letter-spacing: 0.12em;
+      color: #9ca3af;
+      margin-bottom: 2px;
+      font-weight: 700;
+    }
+    .summary-value {
+      font-weight: 600;
+      color: #111827;
+    }
+    .summary-button {
+      align-self: flex-start;
+      padding: 10px 18px;
+      border-radius: 999px;
+      border: none;
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.09em;
+      cursor: pointer;
+      background: linear-gradient(90deg, #bef264, #facc15, #fb923c);
+      color: #022c22;
+      box-shadow: 0 10px 25px rgba(180, 83, 9, 0.25);
+    }
+    .summary-button:focus { outline: none; }
+
+    .score-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: #ecfdf5;
+      color: #047857;
+      font-size: 13px;
+      font-weight: 700;
+      margin: 6px 0 24px;
+    }
+    .score-pill span.total {
+      font-weight: 800;
+    }
+    .score-label {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      color: #6b7280;
+    }
+
+    .section-title {
+      font-size: 15px;
+      font-weight: 700;
+      margin: 24px 0 12px;
+      color: #111827;
+    }
+    .section-divider {
+      border: none;
+      border-top: 1px solid #e5e7eb;
+      margin: 8px 0 20px;
+    }
+
+    .question {
+      border-radius: 18px;
+      border: 1px solid #e5e7eb;
+      background: #ffffff;
+      padding: 16px 18px 14px;
+      margin-bottom: 12px;
+      page-break-inside: avoid;
+    }
+    .question-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 12px;
+      margin-bottom: 10px;
+    }
+    .question-title {
+      font-size: 14px;
+      font-weight: 700;
+      color: #111827;
+      margin-bottom: 2px;
+    }
+    .question-points {
+      font-size: 12px;
+      color: #6b7280;
+    }
+    .question-badge {
+      text-align: right;
+      font-size: 11px;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-weight: 700;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      border: 1px solid transparent;
+    }
+    .badge-correct {
+      background: #ecfdf3;
+      color: #15803d;
+      border-color: #bbf7d0;
+    }
+    .badge-wrong {
+      background: #fef2f2;
+      color: #b91c1c;
+      border-color: #fecaca;
+    }
+    .badge-empty {
+      background: #f9fafb;
+      color: #6b7280;
+      border-color: #e5e7eb;
+    }
+
+    .question-stem {
+      font-size: 13px;
+      color: #111827;
+      margin-bottom: 10px;
+    }
+
+    .fib-chip {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 60px;
+      padding: 2px 8px;
+      margin: 0 3px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      border: 1px solid transparent;
+    }
+    .fib-chip-empty {
+      background: #f9fafb;
+      color: #9ca3af;
+      border-color: #e5e7eb;
+      font-style: italic;
+    }
+    .fib-chip-correct {
+      background: #ecfdf3;
+      color: #166534;
+      border-color: #bbf7d0;
+    }
+    .fib-chip-wrong {
+      background: #fef2f2;
+      color: #b91c1c;
+      border-color: #fecaca;
+    }
+
+    .answer-row {
+      display: grid;
+      grid-template-columns: 140px 1fr;
+      gap: 8px 16px;
+      font-size: 12px;
+      padding-top: 6px;
+      border-top: 1px dashed #e5e7eb;
+      margin-top: 4px;
+    }
+    .answer-label {
+      text-transform: uppercase;
+      font-size: 10px;
+      letter-spacing: 0.14em;
+      color: #9ca3af;
+      font-weight: 700;
+      padding-top: 3px;
+    }
+    .answer-value {
+      color: #111827;
+    }
+    .answer-empty {
+      color: #9ca3af;
+      font-style: italic;
+    }
+
+    @media print {
+      body { background: #fff; }
+      .page {
+        box-shadow: none;
+        border-radius: 0;
+        margin: 0;
+        padding: 16px 24px;
+      }
+      .summary-button {
+        display: none;
+      }
+    }
+  </style>
 </head>
 <body>
-  <h1>Revisión — ${esc(data.exam.title)}</h1>
-  <pre>${esc(header)}</pre>
-  <hr />
-  <pre>${esc(body)}</pre>
+  <main class="page">
+    <header>
+      <h1>Revisión — ${esc(exam.title || "Examen")}</h1>
+      <div class="subtitle">
+        Alumno:
+        <span class="student-name">${esc(studentName)}</span>
+      </div>
+    </header>
+
+    <section class="header-row">
+      <div class="summary-card">
+        <div>
+          <div class="summary-label">Comenzado el</div>
+          <div class="summary-value">${formatDateTime(startedAt)}</div>
+        </div>
+        <div>
+          <div class="summary-label">Estado</div>
+          <div class="summary-value">${statusLabel}</div>
+        </div>
+        <div>
+          <div class="summary-label">Finalizado el</div>
+          <div class="summary-value">${formatDateTime(finishedAt)}</div>
+        </div>
+        <div>
+          <div class="summary-label">Tiempo empleado</div>
+          <div class="summary-value">${durationLabel}</div>
+        </div>
+      </div>
+
+      <button class="summary-button" onclick="window.print()">
+        DESCARGAR / IMPRIMIR PDF
+      </button>
+    </section>
+
+    <section>
+      <div class="score-pill">
+        <span class="total">${totalScore} / ${maxScore} puntos</span>
+        <span class="score-label">Resultado global</span>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-title">Detalle por pregunta</div>
+      <hr class="section-divider" />
+      ${htmlQuestions}
+    </section>
+  </main>
 </body>
-</html>
-`;
+</html>`;
 
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     return res.send(html);
-  } catch (e: any) {
-    return res.status(500).send(e?.message || String(e));
+  } catch (err) {
+    console.error("REVIEW_PRINT_ERROR", err);
+    res
+      .status(500)
+      .send(
+        "Error al generar la revisión imprimible. Ver consola del servidor."
+      );
   }
 });
