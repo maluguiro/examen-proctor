@@ -666,13 +666,13 @@ examsRouter.get("/exams/:code/activity.pdf", async (req, res) => {
     const events =
       attemptIds.length > 0
         ? await prisma.event.findMany({
-            where: { attemptId: { in: attemptIds } },
-            select: {
-              attemptId: true,
-              type: true,
-              reason: true,
-            },
-          })
+          where: { attemptId: { in: attemptIds } },
+          select: {
+            attemptId: true,
+            type: true,
+            reason: true,
+          },
+        })
         : [];
 
     const eventsByAttempt = new Map<
@@ -787,12 +787,11 @@ examsRouter.get("/exams/:code/activity.pdf", async (req, res) => {
           m.fromRole === "teacher"
             ? "Docente"
             : m.fromRole === "student"
-            ? "Alumno"
-            : String(m.fromRole || "");
+              ? "Alumno"
+              : String(m.fromRole || "");
         const broadcast = m.broadcast ? " · 📢 broadcast" : "";
-        const author = `${
-          m.authorName || "(sin nombre)"
-        } (${role}${broadcast})`;
+        const author = `${m.authorName || "(sin nombre)"
+          } (${role}${broadcast})`;
 
         doc.fontSize(11).text(`[${when}] ${author}`);
         doc.text(`   ${m.message}`);
@@ -2106,9 +2105,8 @@ examsRouter.get("/attempts/:id/review.print", async (req, res) => {
             <header class="question-header">
               <div>
                 <div class="question-title">Pregunta ${index}</div>
-                <div class="question-points">${
-                  points === 1 ? "1 punto" : `${points} puntos`
-                }</div>
+                <div class="question-points">${points === 1 ? "1 punto" : `${points} puntos`
+          }</div>
               </div>
               <div class="question-badge">
                 ${renderQuestionBadge(q)}
@@ -2122,22 +2120,20 @@ examsRouter.get("/attempts/:id/review.print", async (req, res) => {
             <div class="answer-row">
               <div class="answer-label">Tu respuesta</div>
               <div class="answer-value">
-                ${
-                  hasAnyAnswer
-                    ? esc(studentText)
-                    : '<span class="answer-empty">Sin respuesta</span>'
-                }
+                ${hasAnyAnswer
+            ? esc(studentText)
+            : '<span class="answer-empty">Sin respuesta</span>'
+          }
               </div>
             </div>
 
             <div class="answer-row">
               <div class="answer-label">Respuestas correctas</div>
               <div class="answer-value">
-                ${
-                  correctText
-                    ? esc(correctText)
-                    : '<span class="answer-empty">Sin respuesta</span>'
-                }
+                ${correctText
+            ? esc(correctText)
+            : '<span class="answer-empty">Sin respuesta</span>'
+          }
               </div>
             </div>
           </section>
@@ -2157,31 +2153,30 @@ examsRouter.get("/attempts/:id/review.print", async (req, res) => {
 
       const studentText =
         rawStudent == null ||
-        (typeof rawStudent === "string" && rawStudent.trim() === "")
+          (typeof rawStudent === "string" && rawStudent.trim() === "")
           ? '<span class="answer-empty">Sin respuesta</span>'
           : esc(
-              Array.isArray(rawStudent)
-                ? rawStudent.join(" / ")
-                : String(rawStudent)
-            );
+            Array.isArray(rawStudent)
+              ? rawStudent.join(" / ")
+              : String(rawStudent)
+          );
 
       const correctText =
         correctAnswer == null || correctAnswer === ""
           ? '<span class="answer-empty">Sin respuesta</span>'
           : esc(
-              Array.isArray(correctAnswer)
-                ? correctAnswer.join(" / ")
-                : String(correctAnswer)
-            );
+            Array.isArray(correctAnswer)
+              ? correctAnswer.join(" / ")
+              : String(correctAnswer)
+          );
 
       return `
         <section class="question">
           <header class="question-header">
             <div>
               <div class="question-title">Pregunta ${index}</div>
-              <div class="question-points">${
-                points === 1 ? "1 punto" : `${points} puntos`
-              }</div>
+              <div class="question-points">${points === 1 ? "1 punto" : `${points} puntos`
+        }</div>
             </div>
             <div class="question-badge">
               ${renderQuestionBadge(q)}
@@ -2214,8 +2209,8 @@ examsRouter.get("/attempts/:id/review.print", async (req, res) => {
       attempt.status || attempt.state || (attempt.finishedAt ? "finished" : "");
     const statusLabel =
       String(statusRaw).toLowerCase() === "finished" ||
-      String(statusRaw).toLowerCase() === "finalized" ||
-      finishedAt
+        String(statusRaw).toLowerCase() === "finalized" ||
+        finishedAt
         ? "Finalizado"
         : "En curso";
 
@@ -2507,7 +2502,7 @@ examsRouter.get("/attempts/:id/review.print", async (req, res) => {
       </div>
 
       <button class="summary-button" onclick="window.print()">
-        DESCARGAR / IMPRIMIR PDF
+        DESCARGAR
       </button>
     </section>
 
