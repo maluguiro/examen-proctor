@@ -1342,6 +1342,43 @@ examsRouter.get("/exams/:code/paper", async (req, res) => {
   }
 });
 
+// Normaliza el tipo de pregunta para no depender de variantes
+function normalizeQuestionKind(kind: any): string {
+  const k = String(kind || "").toUpperCase();
+  if (k === "FIB") return "FILL_IN";
+  if (k === "TEXT") return "SHORT_TEXT";
+  return k;
+}
+
+// Serializa el valor de respuesta para guardarlo en Answer.content
+function serializeAnswerContent(kind: any, value: any): string | null {
+  const k = normalizeQuestionKind(kind);
+
+  // FILL_IN / FIB → guardamos un JSON string de un array de strings
+  if (k === "FILL_IN") {
+    let arr: any[] = [];
+
+    if (Array.isArray(value)) {
+      arr = value;
+    } else if (value && Array.isArray((value as any).answers)) {
+      arr = (value as any).answers;
+    }
+
+    const normalized = arr.map((v) => String(v ?? "").trim());
+    return JSON.stringify(normalized);
+  }
+
+  // MCQ → suele ser un índice numérico, lo guardamos como string
+  if (k === "MCQ") {
+    if (value === null || value === undefined || value === "") return null;
+    return String(value);
+  }
+
+  // TRUE_FALSE / SHORT_TEXT / otros → string plano
+  if (value === null || value === undefined) return null;
+  return String(value);
+}
+
 /**
  * POST /api/attempts/:id/submit
  * Corrige el intento (si gradingMode = auto) y guarda respuestas en Answer.
@@ -1355,12 +1392,16 @@ examsRouter.post("/attempts/:id/submit", async (req, res) => {
     const attempt = await prisma.attempt.findUnique({
       where: { id: req.params.id },
     });
-    if (!attempt) return res.status(404).json({ error: "ATTEMPT_NOT_FOUND" });
+    if (!attempt) {
+      return res.status(404).json({ error: "ATTEMPT_NOT_FOUND" });
+    }
 
     const exam = await prisma.exam.findUnique({
       where: { id: attempt.examId },
     });
-    if (!exam) return res.status(404).json({ error: "EXAM_NOT_FOUND" });
+    if (!exam) {
+      return res.status(404).json({ error: "EXAM_NOT_FOUND" });
+    }
 
     // gradingMode ahora viene de Exam directamente
     let gradingMode: "auto" | "manual" = "auto";
@@ -1368,7 +1409,9 @@ examsRouter.post("/attempts/:id/submit", async (req, res) => {
     if (gm === "manual") gradingMode = "manual";
 
     const arr = Array.isArray(req.body?.answers) ? req.body.answers : [];
-    if (!arr.length) return res.status(400).json({ error: "NO_ANSWERS" });
+    if (!arr.length) {
+      return res.status(400).json({ error: "NO_ANSWERS" });
+    }
 
     await ensureQuestionLite();
 
@@ -1382,7 +1425,7 @@ examsRouter.post("/attempts/:id/submit", async (req, res) => {
       exam.id
     );
 
-    const byId = new Map(qs.map((q) => [q.id, q]));
+    const byId = new Map<string, any>(qs.map((q) => [q.id, q]));
     let totalPoints = 0;
     let score = 0;
 
@@ -1395,8 +1438,10 @@ examsRouter.post("/attempts/:id/submit", async (req, res) => {
 
       let partial: number | null = null;
 
+      // Normalizamos el tipo de pregunta
+      const kind = normalizeQuestionKind(q.kind);
+
       if (gradingMode === "auto") {
-        const kind = String(q.kind || "").toUpperCase();
         let correct: any = null;
 
         try {
@@ -1420,21 +1465,29 @@ examsRouter.post("/attempts/:id/submit", async (req, res) => {
           const given = String(a.value ?? "")
             .trim()
             .toLowerCase();
-          if (corr && given && corr === given) partial = pts;
-          else partial = 0;
+          partial = corr && given && corr === given ? pts : 0;
         } else if (kind === "FILL_IN") {
-          // esperamos { answers: string[] }
+          // esperamos { answers: string[] } o un array
           let expected: string[] = [];
           try {
-            if (Array.isArray(correct?.answers)) {
-              expected = correct.answers.map((x: any) => String(x ?? ""));
+            if (Array.isArray((correct as any)?.answers)) {
+              expected = (correct as any).answers.map((x: any) =>
+                String(x ?? "")
+              );
             }
           } catch {
             expected = [];
           }
-          const givenArr: string[] = Array.isArray(a.value)
-            ? a.value.map((v: any) => String(v ?? ""))
-            : [];
+
+          let givenArr: string[] = [];
+          if (Array.isArray(a.value)) {
+            givenArr = a.value.map((v: any) => String(v ?? ""));
+          } else if (a.value && Array.isArray((a.value as any).answers)) {
+            givenArr = (a.value as any).answers.map((v: any) =>
+              String(v ?? "")
+            );
+          }
+
           let ok = 0;
           expected.forEach((exp, i) => {
             if (
@@ -1444,28 +1497,40 @@ examsRouter.post("/attempts/:id/submit", async (req, res) => {
               ok++;
             }
           });
+
           partial = expected.length ? (pts * ok) / expected.length : 0;
         } else {
           partial = 0;
         }
       }
 
+      // Serializamos SIEMPRE lo que vamos a guardar en Answer.content
+      const storedContent = serializeAnswerContent(q.kind, a.value);
+
       try {
         await prisma.answer.create({
           data: {
             attemptId: attempt.id,
             questionId: q.id,
-            content: typeof a.value === "string" ? a.value : a.value ?? null,
+            content: storedContent,
             score: partial,
           },
         });
       } catch (err) {
-        console.error("ANSWER_CREATE_ERROR (no corta el submit):", err);
-        // No rompemos el flujo si falla la FK:
-        // igual seguimos sumando el puntaje y cerramos el intento.
+        console.error("ANSWER_CREATE_ERROR (no corta el submit):", {
+          err,
+          attemptId: attempt.id,
+          questionId: q.id,
+          kind,
+          rawValue: a.value,
+          storedContent,
+        });
+        // NO cortamos el flujo aunque falle una inserción
       }
 
-      if (typeof partial === "number") score += partial;
+      if (typeof partial === "number") {
+        score += partial;
+      }
     }
 
     await prisma.attempt.update({
@@ -1484,6 +1549,7 @@ examsRouter.post("/attempts/:id/submit", async (req, res) => {
       maxScore: gradingMode === "auto" ? totalPoints : exam.maxScore ?? null,
     });
   } catch (e: any) {
+    console.error("ATTEMPT_SUBMIT_ERROR", e);
     return res.status(500).json({ error: e?.message || String(e) });
   }
 });
@@ -1754,37 +1820,46 @@ examsRouter.post("/s/attempt/:id/event", async (req, res) => {
     return res.status(500).json({ error: e?.message || "ANTIFRAUD_ERROR" });
   }
 });
+
 // GET /api/attempts/:id/review.print
 // Versión HTML estilizada para imprimir/guardar como PDF.
 examsRouter.get("/attempts/:id/review.print", async (req, res) => {
   try {
-    const base = `http://localhost:${process.env.PORT || 3001}`;
-    const r = await fetch(`${base}/api/attempts/${req.params.id}/review`);
+    const baseUrl = `http://localhost:${process.env.PORT || 3001}`;
+    const id = req.params.id;
 
+    const r = await fetch(`${baseUrl}/api/attempts/${id}/review`);
     if (!r.ok) {
       const text = await r.text();
       return res.status(r.status).send(text);
     }
 
-    const data = await r.json();
-    const attempt = data.attempt || {};
-    const exam = data.exam || {};
-    const questions: any[] = Array.isArray(data.questions)
-      ? data.questions
+    const review = await r.json();
+
+    // --- DEBUG TEMPORAL (Solicitado) ---
+    console.log("REVIEW JSON:", JSON.stringify(review, null, 2));
+    // -----------------------------------
+
+    const exam = review.exam || {};
+    const attempt = review.attempt || {};
+    const questions: any[] = Array.isArray(review.questions)
+      ? review.questions
       : [];
 
-    // --- Helpers básicos ----------------------------------------------
+    // ---------- HELPERS BÁSICOS ----------
 
-    const esc = (v: any) =>
-      String(v ?? "")
+    const escapeHtml = (str: any) =>
+      String(str ?? "")
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;");
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
 
-    const formatDateTime = (raw: any) => {
-      if (!raw) return "-";
-      const d = new Date(raw);
-      if (Number.isNaN(d.getTime())) return "-";
+    function formatDateTime(value: any) {
+      if (!value) return "-";
+      const d = new Date(value);
+      if (isNaN(d.getTime())) return "-";
       return d.toLocaleString("es-AR", {
         day: "2-digit",
         month: "2-digit",
@@ -1793,743 +1868,465 @@ examsRouter.get("/attempts/:id/review.print", async (req, res) => {
         minute: "2-digit",
         second: "2-digit",
       });
-    };
+    }
 
-    function formatDuration(totalSeconds: number | null | undefined): string {
-      if (totalSeconds == null || !Number.isFinite(totalSeconds)) return "-";
-      const secs = Math.max(0, Math.round(totalSeconds));
-      const hours = Math.floor(secs / 3600);
-      const minutes = Math.floor((secs % 3600) / 60);
-      const seconds = secs % 60;
+    function formatDuration(secondsRaw: any) {
+      const total = Number(secondsRaw);
+      if (!isFinite(total) || total <= 0) return "-";
+
+      const hours = Math.floor(total / 3600);
+      const minutes = Math.floor((total % 3600) / 60);
+      const seconds = Math.floor(total % 60);
 
       const parts: string[] = [];
-      if (hours > 0) parts.push(`${hours} hora${hours !== 1 ? "s" : ""}`);
-      if (minutes > 0)
-        parts.push(`${minutes} minuto${minutes !== 1 ? "s" : ""}`);
-      if (hours === 0 && seconds > 0) {
-        // Solo mostramos segundos si no hubo horas
-        parts.push(`${seconds} segundo${seconds !== 1 ? "s" : ""}`);
+      if (hours > 0) parts.push(`${hours} ${hours === 1 ? "hora" : "horas"}`);
+      if (minutes > 0) {
+        parts.push(`${minutes} ${minutes === 1 ? "minuto" : "minutos"}`);
       }
-
-      return parts.length ? parts.join(" ") : "0 segundos";
+      if (seconds > 0 || parts.length === 0) {
+        parts.push(`${seconds} ${seconds === 1 ? "segundo" : "segundos"}`);
+      }
+      return parts.join(" ");
     }
 
-    const startedAt =
-      attempt.startedAt ||
-      attempt.started_at ||
-      attempt.startedAtUtc ||
-      attempt.startTime;
-    const finishedAt =
-      attempt.finishedAt ||
-      attempt.finished_at ||
-      attempt.finishedAtUtc ||
-      attempt.endTime;
+    // Lógica de redondeo solicitada:
+    // < 0.5 -> baja al entero
+    // = 0.5 -> queda en .5
+    // > 0.5 -> sube al entero
+    function formatSmartScore(score: number): string {
+      const integer = Math.floor(score);
+      const decimal = score - integer;
 
-    let durationSeconds: number | null =
-      attempt.durationSeconds ??
-      attempt.secondsTaken ??
-      attempt.timeTakenSeconds ??
-      null;
+      let final = integer;
+      // Usamos un pequeño margen para float precision (opsional)
+      if (decimal > 0.50001) {
+        final += 1;
+      } else if (Math.abs(decimal - 0.5) < 0.00001) {
+        final += 0.5;
+      }
+      // si decimal < 0.5 queda en entero
 
-    if (durationSeconds == null && startedAt && finishedAt) {
-      const diff =
-        (new Date(finishedAt).getTime() - new Date(startedAt).getTime()) / 1000;
-      if (Number.isFinite(diff) && diff >= 0) {
-        durationSeconds = Math.round(diff);
+      return final.toString().replace(".", ",");
+    }
+
+    // ---------- HELPERS DE EXTRACCIÓN (ROBUSTOS) ----------
+
+    function safeJsonParse(val: any): any {
+      if (typeof val !== "string") return val;
+      const trimmed = val.trim();
+      if (!trimmed) return null;
+      try {
+        return JSON.parse(trimmed);
+      } catch {
+        return val;
       }
     }
 
-    const totalScore =
-      attempt.totalScore ?? attempt.score ?? data.totalScore ?? data.score ?? 0;
-    const maxScore =
-      attempt.maxScore ?? data.maxScore ?? data.maxPoints ?? data.points ?? 0;
-
-    // --- Helpers específicos para FIB ---------------------------------
-
-    // Convierte "algo" en un array de strings (sirve para FIB)
     function extractAnswersArray(raw: any): string[] {
-      if (!raw) return [];
+      if (raw == null) return [];
 
-      if (Array.isArray(raw)) {
-        return raw.map((v) => String(v ?? ""));
-      }
+      let v = raw;
 
-      if (typeof raw === "object") {
-        if (Array.isArray((raw as any).answers)) {
-          return (raw as any).answers.map((v: any) => String(v ?? ""));
-        }
-        if (Array.isArray((raw as any).values)) {
-          return (raw as any).values.map((v: any) => String(v ?? ""));
+      if (typeof v === "string") {
+        const parsed = safeJsonParse(v);
+        if (parsed !== v) {
+          v = parsed;
+        } else {
+          return [v.trim()];
         }
       }
 
-      if (typeof raw === "string" && raw.trim().length > 0) {
-        return [raw.trim()];
+      if (Array.isArray(v)) {
+        return v.map((x) => String(x ?? "").trim());
       }
 
-      return [];
-    }
-
-    // Busca en cualquier propiedad-objeto del ítem algo con .answers[]
-    function findNestedAnswersArray(
-      obj: any,
-      excludeKeys: string[] = []
-    ): string[] {
-      if (!obj || typeof obj !== "object") return [];
-
-      for (const [key, value] of Object.entries(obj)) {
-        if (excludeKeys.includes(key)) continue;
-        if (
-          value &&
-          typeof value === "object" &&
-          Array.isArray((value as any).answers)
-        ) {
-          return (value as any).answers.map((v: any) => String(v ?? ""));
+      if (v && typeof v === "object") {
+        if (Array.isArray((v as any).answers)) {
+          return (v as any).answers.map((x: any) => String(x ?? "").trim());
         }
-      }
-
-      return [];
-    }
-    const CORRECT_KEYS = new Set([
-      "correct",
-      "correctAnswers",
-      "correctAnswer",
-      "solution",
-      "expected",
-      "key",
-    ]);
-
-    // Intenta encontrar "la respuesta del alumno" en muchas formas posibles
-    function extractStudentValue(q: any): any {
-      const directKeys = [
-        "studentAnswer",
-        "studentAnswers",
-        "student",
-        "given",
-        "answer",
-        "selected",
-        "value",
-        "response",
-        "choice",
-      ];
-
-      // 1) Claves directas en la raíz del objeto
-      for (const key of directKeys) {
-        if (Object.prototype.hasOwnProperty.call(q, key)) {
-          const v = (q as any)[key];
-          if (v !== undefined && v !== null) return v;
+        if (Array.isArray((v as any).values)) {
+          return (v as any).values.map((x: any) => String(x ?? "").trim());
         }
+        // Fallback: tratar como mapa de valores (ej { "0": "val" })
+        return Object.values(v).map((x) => String(x ?? "").trim());
       }
 
-      // 2) Buscar en sub-objetos (pero sin meternos en "correct", "solution", etc.)
-      for (const [key, value] of Object.entries(q)) {
-        if (CORRECT_KEYS.has(key)) continue;
-        if (!value || typeof value !== "object") continue;
-
-        const obj = value as any;
-
-        if (obj.student != null) return obj.student;
-        if (obj.answer != null) return obj.answer;
-        if (obj.value != null) return obj.value;
-        if (Array.isArray(obj.answers)) return obj.answers;
-      }
-
-      return null;
+      return [String(v ?? "").trim()];
     }
 
-    function extractFibStudentAnswers(q: any): string[] {
-      // 1) Candidatos directos
-      const candidates = [
-        q.studentAnswers,
-        q.studentAnswer,
-        q.answer,
-        q.student,
-        q.given,
-      ];
-
-      for (const c of candidates) {
-        const arr = extractAnswersArray(c);
-        if (arr.length) return arr;
-      }
-
-      // 2) Intenta usar el helper genérico
-      const generic = extractStudentValue(q);
-      const genericArr = extractAnswersArray(generic);
-      if (genericArr.length) return genericArr;
-
-      // 3) Fallback: cualquier objeto con .answers dentro de la pregunta,
-      // excluyendo los típicos de "correctas"
-      const nested = findNestedAnswersArray(q, Array.from(CORRECT_KEYS));
-      if (nested.length) return nested;
-
-      return [];
-    }
-
-    function extractFibCorrectAnswers(q: any): string[] {
-      // 1) Candidatos directos
-      const candidates = [
-        q.correctAnswers,
-        q.correctAnswer,
-        q.solution,
-        q.expected,
-        q.key,
-        q.correctValue,
-        q.correct,
-      ];
-
-      for (const c of candidates) {
-        const arr = extractAnswersArray(c);
-        if (arr.length) return arr;
-      }
-
-      // 2) Fallback: dentro de q.correct si es un objeto
-      if (q.correct && typeof q.correct === "object") {
-        const nested = findNestedAnswersArray(q.correct);
-        if (nested.length) return nested;
-      }
-
-      return [];
-    }
-
-    function isFibQuestion(q: any): boolean {
-      const kind = String(q.kind || q.type || "").toUpperCase();
-      if (kind === "FIB" || kind === "FILL_IN") return true;
-
-      if (
-        Array.isArray(q.correctAnswers) ||
-        (q.correct &&
-          typeof q.correct === "object" &&
-          (q.correct as any).answers)
-      ) {
-        return true;
-      }
-
-      return false;
-    }
+    // ---------- RENDER FIB CON CHIPS ----------
 
     function renderFibStem(
       stem: string,
-      studentArr: string[],
-      correctArr: string[]
+      student: string[],
+      correct: string[]
     ): string {
-      if (!stem) return "";
+      const parts: string[] = [];
+      const re = /\[\[(.*?)\]\]/g;
 
-      const re = /\[\[(\d+)\]\]/g;
       let lastIndex = 0;
       let match: RegExpExecArray | null;
-      let html = "";
+      let boxIndex = 0;
+
+      const normStudent = student.map((s) => s || "");
+      const normCorrect = correct.map((c) => c || "");
 
       while ((match = re.exec(stem)) !== null) {
-        const idx = parseInt(match[1], 10) - 1; // [[1]] -> index 0
         if (match.index > lastIndex) {
-          html += esc(stem.slice(lastIndex, match.index));
+          parts.push(
+            `<span>${escapeHtml(stem.slice(lastIndex, match.index))}</span>`
+          );
         }
 
-        const studentVal = studentArr[idx] ?? "";
-        const correctVal = correctArr[idx] ?? "";
+        const sVal = normStudent[boxIndex] ?? "";
 
-        const trimmed = studentVal.trim();
-        const hasAnswer = trimmed.length > 0;
-        const isCorrect = hasAnswer && trimmed === correctVal;
+        // Moodle style input look
+        parts.push(`<span class="fib-input">${escapeHtml(sVal || "")}</span>`);
 
-        let cls = "fib-chip-empty";
-        if (hasAnswer && isCorrect) cls = "fib-chip-correct";
-        else if (hasAnswer && !isCorrect) cls = "fib-chip-wrong";
-
-        const label = hasAnswer ? esc(trimmed) : "_____";
-
-        html += `<span class="fib-chip ${cls}">${label}</span>`;
-
+        boxIndex++;
         lastIndex = match.index + match[0].length;
       }
 
       if (lastIndex < stem.length) {
-        html += esc(stem.slice(lastIndex));
+        parts.push(`<span>${escapeHtml(stem.slice(lastIndex))}</span>`);
       }
 
-      return html;
+      if (parts.length === 0) return `<span>${escapeHtml(stem)}</span>`;
+
+      return parts.join("");
     }
 
-    function renderQuestionBadge(q: any): string {
-      if (isFibQuestion(q)) {
-        const studentArr = extractFibStudentAnswers(q);
-        const correctArr = extractFibCorrectAnswers(q);
+    // ---------- Render por pregunta ----------
 
-        const hasAny = studentArr.some((v) => v && v.trim().length > 0);
+    function renderQuestionCard(q: any, idx: number): string {
+      const kind = String(q.kind || "").toUpperCase();
+      const stemString = q.stem ?? q.text ?? "";
+      const points = Number(q.points ?? q.maxScore ?? 0) || 0;
+      const scoreObtained = q.score !== null && q.score !== undefined ? Number(q.score) : 0;
 
-        const allCorrect =
-          hasAny &&
-          studentArr.length === correctArr.length &&
-          studentArr.every((v, i) => v === (correctArr[i] ?? ""));
+      const studentArr = extractAnswersArray(q.given);
+      const correctArr = extractAnswersArray(q.correct);
 
-        if (allCorrect) {
-          return `<span class="badge badge-correct">Respuesta correcta</span>`;
+      // --- DEBUG GRANULAR SOLICITADO ---
+      if (studentArr.length === 0 && q.given) {
+        console.log(`[DEBUG] Question ${idx + 1} empty extraction. q.given:`, JSON.stringify(q.given));
+      }
+      // ---------------------------------
+
+      let statusText = "Sin responder";
+      let statusClass = "unanswered";
+
+      // Determinar estado basado en puntaje
+      if (studentArr.length > 0 && studentArr.some(s => s)) {
+        if (scoreObtained >= points) {
+          statusText = "Correcta";
+          statusClass = "correct";
+        } else if (scoreObtained > 0) {
+          statusText = "Parcialmente correcta";
+          statusClass = "incorrect"; // Usamos rojo para no complicar, o Moodle usa 'partially correct' (naranja)
+        } else {
+          statusText = "Incorrecta";
+          statusClass = "incorrect";
         }
-        if (hasAny) {
-          return `<span class="badge badge-wrong">Respuesta incorrecta</span>`;
-        }
-        return `<span class="badge badge-empty">Sin respuesta</span>`;
+      } else {
+        statusText = "Sin responder";
+        statusClass = "unanswered";
       }
 
-      // No-FIB: usamos flags del backend
-      if (q.correct === true || q.isCorrect === true) {
-        return `<span class="badge badge-correct">Respuesta correcta</span>`;
-      }
-      if (q.correct === false || q.isCorrect === false) {
-        return `<span class="badge badge-wrong">Respuesta incorrecta</span>`;
-      }
-      return `<span class="badge badge-empty">Sin respuesta</span>`;
-    }
+      // ------------ RENDER CONTENIDO (MCQ con opciones) ------------
+      let contentHtml = "";
+      let niceCorrectText = "";
 
-    function renderQuestionCard(q: any, index: number): string {
-      const stem = esc(q.stem || q.text || "");
-      const points =
-        q.points ?? q.score ?? q.maxPoints ?? q.maxScore ?? q.value ?? 1;
+      if (kind === "MCQ" || kind === "TRUE_FALSE") {
+        const choices = q.choices && Array.isArray(q.choices) ? q.choices : [];
 
-      // FIB
-      if (isFibQuestion(q)) {
-        const studentArr = extractFibStudentAnswers(q);
-        const correctArr = extractFibCorrectAnswers(q);
-
-        const studentText = studentArr
-          .filter((v) => v && v.trim().length > 0)
-          .join(" / ");
-        const correctText = correctArr.join(" / ");
-
-        const hasAnyAnswer = studentText.length > 0;
-
-        const fibStemHtml = renderFibStem(q.stem || "", studentArr, correctArr);
-
-        return `
-          <section class="question">
-            <header class="question-header">
-              <div>
-                <div class="question-title">Pregunta ${index}</div>
-                <div class="question-points">${points === 1 ? "1 punto" : `${points} puntos`
-          }</div>
-              </div>
-              <div class="question-badge">
-                ${renderQuestionBadge(q)}
-              </div>
-            </header>
-
-            <div class="question-stem">
-              ${fibStemHtml || stem}
-            </div>
-
-            <div class="answer-row">
-              <div class="answer-label">Tu respuesta</div>
-              <div class="answer-value">
-                ${hasAnyAnswer
-            ? esc(studentText)
-            : '<span class="answer-empty">Sin respuesta</span>'
+        // Preparamos texto de respuesta correcta
+        const niceCorrectArr = correctArr.map(cVal => {
+          // Si es un índice
+          if (!isNaN(Number(cVal)) && choices[Number(cVal)]) return choices[Number(cVal)];
+          // Si es "true"/"false" y no hay choices (TRUE_FALSE sin choices explícitos)
+          if (kind === "TRUE_FALSE" && choices.length === 0) {
+            return cVal === "true" ? "Verdadero" : "Falso";
           }
-              </div>
-            </div>
+          return cVal;
+        });
+        niceCorrectText = niceCorrectArr.join(", ");
 
-            <div class="answer-row">
-              <div class="answer-label">Respuestas correctas</div>
-              <div class="answer-value">
-                ${correctText
-            ? esc(correctText)
-            : '<span class="answer-empty">Sin respuesta</span>'
+        const listHtml = choices.map((choiceLabel: string, i: number) => {
+          const strIndex = String(i);
+          const isSelected = studentArr.includes(strIndex) || studentArr.includes(choiceLabel) || studentArr.some(s => s.toLowerCase() === choiceLabel.toLowerCase());
+          const isCorrectOption = correctArr.includes(strIndex) || correctArr.includes(choiceLabel) || correctArr.some(c => c.toLowerCase() === choiceLabel.toLowerCase());
+
+          let iconHtml = "";
+          if (isSelected) {
+            if (isCorrectOption) iconHtml = `<span class="feedback-icon icon-check">✔️</span>`;
+            else iconHtml = `<span class="feedback-icon icon-cross">❌</span>`;
+          } else if (isCorrectOption) {
+            // Opción correcta NO seleccionada (Moodle a veces marca check aquí también, o solo abajo)
+            // Dejamos vacío y usamos el feedback box abajo.
           }
-              </div>
-            </div>
-          </section>
-        `;
+
+          // Letras a, b, c...
+          const letter = String.fromCharCode(97 + i); // 97 = 'a'
+
+          return `
+               <div class="choice-item">
+                 <div class="radio-sim ${isSelected ? 'selected' : ''}"></div>
+                 <div class="choice-text">
+                   <strong style="margin-right:4px;">${letter}.</strong> ${escapeHtml(choiceLabel)}
+                   ${iconHtml}
+                 </div>
+               </div>
+             `;
+        }).join("");
+
+        contentHtml = `<div class="choice-list">${listHtml}</div>`;
+
+      } else if (kind === "FIB" || kind === "FILL_IN") {
+        contentHtml = `<div style="margin-bottom:16px;">${renderFibStem(stemString, studentArr, correctArr)}</div>`;
+        niceCorrectText = correctArr.join(", ");
+      } else {
+        // SHORT TEXT u otros
+        contentHtml = `<div style="padding: 10px; background:#f8f9fa; border:1px solid #dee2e6;">${escapeHtml(studentArr.join(" / ") || "")}</div>`;
+        niceCorrectText = correctArr.join(", ");
       }
-
-      // Preguntas NO FIB
-      const rawStudent = extractStudentValue(q);
-      const correctAnswer =
-        q.correctAnswer ??
-        q.correctAnswers ??
-        q.solution ??
-        q.expected ??
-        q.key ??
-        q.correct ??
-        null;
-
-      const studentText =
-        rawStudent == null ||
-          (typeof rawStudent === "string" && rawStudent.trim() === "")
-          ? '<span class="answer-empty">Sin respuesta</span>'
-          : esc(
-            Array.isArray(rawStudent)
-              ? rawStudent.join(" / ")
-              : String(rawStudent)
-          );
-
-      const correctText =
-        correctAnswer == null || correctAnswer === ""
-          ? '<span class="answer-empty">Sin respuesta</span>'
-          : esc(
-            Array.isArray(correctAnswer)
-              ? correctAnswer.join(" / ")
-              : String(correctAnswer)
-          );
 
       return `
-        <section class="question">
-          <header class="question-header">
-            <div>
-              <div class="question-title">Pregunta ${index}</div>
-              <div class="question-points">${points === 1 ? "1 punto" : `${points} puntos`
-        }</div>
-            </div>
-            <div class="question-badge">
-              ${renderQuestionBadge(q)}
-            </div>
-          </header>
+      <article class="moodle-card">
+        <div class="info-col">
+          <div class="q-no">Pregunta ${idx + 1}</div>
+          <div class="q-status ${statusClass}">${escapeHtml(statusText)}</div>
+          <div class="q-grade">Se puntúa ${formatSmartScore(scoreObtained)} sobre ${points}</div>
+        </div>
 
-          <div class="question-stem">
-            ${stem}
+        <div class="content-col">
+          <div class="q-stem">${escapeHtml(stemString)}</div>
+          ${contentHtml}
+          
+          <div class="feedback-box">
+             La respuesta correcta es: ${escapeHtml(niceCorrectText)}
           </div>
-
-          <div class="answer-row">
-            <div class="answer-label">Tu respuesta</div>
-            <div class="answer-value">${studentText}</div>
-          </div>
-
-          <div class="answer-row">
-            <div class="answer-label">Respuesta correcta</div>
-            <div class="answer-value">${correctText}</div>
-          </div>
-        </section>
+        </div>
+      </article>
       `;
     }
 
-    // --- HTML principal ------------------------------------------------
+    const questionsHtml = questions
+      .map((q, idx) => renderQuestionCard(q, idx))
+      .join("\n");
 
-    const studentName =
-      attempt.studentName || attempt.student || attempt.name || "Alumno";
+    // ---------- Datos encabezado ----------
 
-    const statusRaw =
-      attempt.status || attempt.state || (attempt.finishedAt ? "finished" : "");
-    const statusLabel =
-      String(statusRaw).toLowerCase() === "finished" ||
-        String(statusRaw).toLowerCase() === "finalized" ||
-        finishedAt
+    const title = exam.title || "Examen";
+    const studentName = attempt.studentName || attempt.student || "Alumno";
+
+    const startedAt = attempt.startedAt || attempt.started_at;
+    const finishedAt = attempt.finishedAt || attempt.finished_at;
+
+    let durationSeconds = attempt.durationSeconds;
+    if (
+      (durationSeconds == null || !isFinite(Number(durationSeconds))) &&
+      startedAt &&
+      finishedAt
+    ) {
+      const t1 = new Date(startedAt).getTime();
+      const t2 = new Date(finishedAt).getTime();
+      if (isFinite(t1) && isFinite(t2) && t2 > t1) {
+        durationSeconds = Math.round((t2 - t1) / 1000);
+      }
+    }
+
+    const score = attempt.score ?? review.totalScore ?? 0;
+    const maxScore = attempt.maxScore ?? review.maxScore ?? 0;
+
+    const status =
+      finishedAt || attempt.completedAt || attempt.completed_at
         ? "Finalizado"
         : "En curso";
 
-    const durationLabel = formatDuration(durationSeconds);
+    // Calcular porcentaje
+    let percentage = "0";
+    if (maxScore > 0) {
+      percentage = ((score / maxScore) * 100).toFixed(0); // Sin decimales o 1 decimal
+    }
 
-    const htmlQuestions = questions
-      .map((q, idx) => renderQuestionCard(q, idx + 1))
-      .join("");
-
-    const html = `<!DOCTYPE html>
+    const html = `<!doctype html>
 <html lang="es">
 <head>
   <meta charset="utf-8" />
-  <title>Revisión — ${esc(exam.title || "Examen")}</title>
+  <title>Revisión — ${escapeHtml(title)}</title>
   <style>
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      padding: 32px 0;
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: radial-gradient(circle at top left, #e9ffe4 0, #f7fbe9 40%, #fdfdfd 100%);
-      color: #111827;
-    }
-    .page {
-      max-width: 900px;
-      margin: 0 auto;
-      background: rgba(255,255,255,0.96);
-      border-radius: 24px;
-      box-shadow: 0 18px 50px rgba(15, 118, 110, 0.08);
-      padding: 32px 40px 40px;
-    }
-    h1 {
-      margin: 0 0 8px;
-      font-size: 28px;
-      font-weight: 800;
-      color: #111827;
-    }
-    .subtitle {
-      font-size: 14px;
-      color: #6b7280;
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+    body { background: #fff; color: #333; padding: 20px; font-size: 14px; }
+    .page { max-width: 900px; margin: 0 auto; }
+    
+    .main-title { font-size: 24px; font-weight: normal; margin-bottom: 5px; color: #333; }
+    .sub-title { font-size: 18px; font-weight: normal; margin-bottom: 20px; color: #555; }
+
+    .generaltable {
+      width: 100%;
+      border-collapse: collapse;
       margin-bottom: 24px;
-    }
-    .student-name {
-      font-weight: 700;
-      color: #059669;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-    }
-    .header-row {
-      display: flex;
-      justify-content: space-between;
-      align-items: flex-start;
-      gap: 16px;
-      margin-bottom: 24px;
-    }
-    .summary-card {
-      flex: 1;
-      background: linear-gradient(135deg, #fefce8, #ecfccb);
-      border-radius: 20px;
-      padding: 16px 20px;
-      display: grid;
-      grid-template-columns: 1.3fr 1.1fr;
-      gap: 12px 24px;
       font-size: 13px;
-      color: #374151;
     }
-    .summary-label {
-      text-transform: uppercase;
-      font-size: 11px;
-      letter-spacing: 0.12em;
-      color: #9ca3af;
-      margin-bottom: 2px;
-      font-weight: 700;
+    .generaltable th, .generaltable td {
+      padding: 8px 12px;
+      border-top: 1px solid #dee2e6;
+      text-align: left;
+      vertical-align: top;
     }
-    .summary-value {
-      font-weight: 600;
-      color: #111827;
-    }
-    .summary-button {
-      align-self: flex-start;
-      padding: 10px 18px;
-      border-radius: 999px;
-      border: none;
-      font-size: 12px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.09em;
-      cursor: pointer;
-      background: linear-gradient(90deg, #bef264, #facc15, #fb923c);
-      color: #022c22;
-      box-shadow: 0 10px 25px rgba(180, 83, 9, 0.25);
-    }
-    .summary-button:focus { outline: none; }
-
-    .score-pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 6px 12px;
-      border-radius: 999px;
-      background: #ecfdf5;
-      color: #047857;
-      font-size: 13px;
-      font-weight: 700;
-      margin: 6px 0 24px;
-    }
-    .score-pill span.total {
-      font-weight: 800;
-    }
-    .score-label {
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.12em;
-      color: #6b7280;
-    }
-
-    .section-title {
-      font-size: 15px;
-      font-weight: 700;
-      margin: 24px 0 12px;
-      color: #111827;
-    }
-    .section-divider {
-      border: none;
-      border-top: 1px solid #e5e7eb;
-      margin: 8px 0 20px;
-    }
-
-    .question {
-      border-radius: 18px;
-      border: 1px solid #e5e7eb;
-      background: #ffffff;
-      padding: 16px 18px 14px;
-      margin-bottom: 12px;
-      page-break-inside: avoid;
-    }
-    .question-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: flex-start;
-      gap: 12px;
-      margin-bottom: 10px;
-    }
-    .question-title {
-      font-size: 14px;
-      font-weight: 700;
-      color: #111827;
-      margin-bottom: 2px;
-    }
-    .question-points {
-      font-size: 12px;
-      color: #6b7280;
-    }
-    .question-badge {
+    .generaltable th {
+      background-color: #f8f9fa;
+      width: 160px;
+      font-weight: bold;
       text-align: right;
-      font-size: 11px;
+      color: #333;
     }
+    .generaltable tr:last-child {
+      border-bottom: 1px solid #dee2e6;
+    }
+    .actions-row { margin-bottom: 30px; }
+    
+    .print-button {
+      background-color: #0f6cbf;
+      color: white;
+      text-decoration: none;
+      padding: 8px 14px;
+      border-radius: 4px;
+      border: none;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    .print-button:hover { background-color: #0d5ca0; }
 
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      padding: 4px 10px;
-      border-radius: 999px;
-      font-weight: 700;
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.12em;
-      border: 1px solid transparent;
+    .section-title { font-size: 18px; color: #C02424; margin-bottom: 15px; font-weight: normal; border-bottom: 1px solid #dee2e6; padding-bottom: 5px; }
+    
+    .questions-list { display: flex; flex-direction: column; gap: 15px; }
+    
+    /* Existing styles that were kept or modified */
+    .moodle-card {
+      display: flex;
+      flex-direction: row;
+      background: #fff;
+      border: 1px solid #ced4da;
+      margin-bottom: 24px;
+      padding: 0;
     }
-    .badge-correct {
-      background: #ecfdf3;
-      color: #15803d;
-      border-color: #bbf7d0;
+    .info-col {
+      width: 140px;
+      min-width: 140px;
+      background: #f8f9fa;
+      border-right: 1px solid #ced4da;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
     }
-    .badge-wrong {
-      background: #fef2f2;
-      color: #b91c1c;
-      border-color: #fecaca;
-    }
-    .badge-empty {
-      background: #f9fafb;
-      color: #6b7280;
-      border-color: #e5e7eb;
-    }
+    .q-no { font-size: 16px; font-weight: bold; color: #DC3545; margin-bottom: 4px; }
+    .q-status { font-size: 13px; font-weight: bold; margin-bottom: 4px; display: block; }
+    .q-status.correct { color: #0f5132; }
+    .q-status.incorrect { color: #842029; }
+    .q-status.unanswered { color: #842029; }
+    
+    .q-grade { font-size: 11px; color: #495057; line-height: 1.3; margin-top: 8px; border-top: 1px solid #dee2e6; padding-top: 4px; }
 
-    .question-stem {
+    .content-col {
+      flex: 1;
+      padding: 24px 32px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+    }
+    .q-stem { font-size: 15px; margin-bottom: 20px; color: #212529; font-weight: 500; }
+    
+    .choice-list { display: flex; flex-direction: column; gap: 10px; margin-bottom: 20px; }
+    .choice-item { display: flex; align-items: flex-start; gap: 12px; font-size: 14px; position: relative; }
+    .radio-sim {
+      width: 16px; height: 16px; border: 1px solid #adb5bd; border-radius: 50%;
+      flex-shrink: 0; margin-top: 2px; display: flex; align-items: center; justify-content: center;
+    }
+    .radio-sim.selected::after {
+      content: ''; width: 8px; height: 8px; background: #212529; border-radius: 50%;
+    }
+    .choice-text { line-height: 1.4; color: #212529; display: flex; align-items: center; gap: 8px;}
+    .feedback-icon { font-size: 16px; line-height: 1; }
+    .icon-check { color: #198754; font-weight: bold; }
+    .icon-cross { color: #dc3545; font-weight: bold; }
+
+    .feedback-box {
+      margin-top: 20px;
+      background: #fdfdfe; /* light background */
+      border: 1px solid #e9ecef;
+      color: #72500d; /* yellowish/brown text */
+      background-color: #fff3cd; /* Moodle yellow */
+      border-color: #ffecb5;
+      padding: 12px 16px;
+      border-radius: 4px;
       font-size: 13px;
-      color: #111827;
-      margin-bottom: 10px;
     }
-
-    .fib-chip {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      min-width: 60px;
-      padding: 2px 8px;
-      margin: 0 3px;
-      border-radius: 999px;
-      font-size: 12px;
-      font-weight: 600;
-      border: 1px solid transparent;
+    .fib-input {
+      display: inline-block; padding: 4px 8px; border: 1px solid #ced4da;
+      background: #fff; min-width: 80px; text-align: center; border-radius: 2px;
+      font-weight: 500; margin: 0 4px; color: #212529;
     }
-    .fib-chip-empty {
-      background: #f9fafb;
-      color: #9ca3af;
-      border-color: #e5e7eb;
-      font-style: italic;
-    }
-    .fib-chip-correct {
-      background: #ecfdf3;
-      color: #166534;
-      border-color: #bbf7d0;
-    }
-    .fib-chip-wrong {
-      background: #fef2f2;
-      color: #b91c1c;
-      border-color: #fecaca;
-    }
-
-    .answer-row {
-      display: grid;
-      grid-template-columns: 140px 1fr;
-      gap: 8px 16px;
-      font-size: 12px;
-      padding-top: 6px;
-      border-top: 1px dashed #e5e7eb;
-      margin-top: 4px;
-    }
-    .answer-label {
-      text-transform: uppercase;
-      font-size: 10px;
-      letter-spacing: 0.14em;
-      color: #9ca3af;
-      font-weight: 700;
-      padding-top: 3px;
-    }
-    .answer-value {
-      color: #111827;
-    }
-    .answer-empty {
-      color: #9ca3af;
-      font-style: italic;
-    }
-
     @media print {
-      body { background: #fff; }
-      .page {
-        box-shadow: none;
-        border-radius: 0;
-        margin: 0;
-        padding: 16px 24px;
-      }
-      .summary-button {
-        display: none;
-      }
+      body { background: #fff; padding: 0; }
+      .page { box-shadow: none; border: none; padding: 0; max-width: none; }
+      .print-button { display: none; }
+      .moodle-card { break-inside: avoid; border: 1px solid #000; }
+      .info-col { background: #f8f9fa !important; -webkit-print-color-adjust: exact; }
+      .feedback-box { background: #fff3cd !important; -webkit-print-color-adjust: exact; }
     }
   </style>
 </head>
 <body>
-  <main class="page">
-    <header>
-      <h1>Revisión — ${esc(exam.title || "Examen")}</h1>
-      <div class="subtitle">
-        Alumno:
-        <span class="student-name">${esc(studentName)}</span>
-      </div>
-    </header>
+  <div class="page">
+    <h2 class="main-title">Revisión — ${escapeHtml(title)}</h2>
+    <h3 class="sub-title">Alumno: ${escapeHtml(studentName)}</h3>
 
-    <section class="header-row">
-      <div class="summary-card">
-        <div>
-          <div class="summary-label">Comenzado el</div>
-          <div class="summary-value">${formatDateTime(startedAt)}</div>
-        </div>
-        <div>
-          <div class="summary-label">Estado</div>
-          <div class="summary-value">${statusLabel}</div>
-        </div>
-        <div>
-          <div class="summary-label">Finalizado el</div>
-          <div class="summary-value">${formatDateTime(finishedAt)}</div>
-        </div>
-        <div>
-          <div class="summary-label">Tiempo empleado</div>
-          <div class="summary-value">${durationLabel}</div>
-        </div>
-      </div>
+    <table class="generaltable">
+      <tbody>
+        <tr>
+          <th scope="row">Comenzado el</th>
+          <td>${escapeHtml(formatDateTime(startedAt))}</td>
+        </tr>
+        <tr>
+          <th scope="row">Estado</th>
+          <td>${escapeHtml(status)}</td>
+        </tr>
+        <tr>
+          <th scope="row">Finalizado en</th>
+          <td>${escapeHtml(formatDateTime(finishedAt))}</td>
+        </tr>
+        <tr>
+          <th scope="row">Tiempo empleado</th>
+          <td>${escapeHtml(formatDuration(durationSeconds))}</td>
+        </tr>
+        <tr>
+          <th scope="row">Calificación</th>
+          <td><b>${formatSmartScore(score)}</b> de ${maxScore} (${percentage}%)</td>
+        </tr>
+      </tbody>
+    </table>
 
-      <button class="summary-button" onclick="window.print()">
-        DESCARGAR
+    <div class="actions-row">
+      <button class="print-button" onclick="window.print()">
+        DESCARGAR PDF
       </button>
-    </section>
+    </div>
 
-    <section>
-      <div class="score-pill">
-        <span class="total">${totalScore} / ${maxScore} puntos</span>
-        <span class="score-label">Resultado global</span>
-      </div>
+    <h2 class="section-title">Detalle por pregunta</h2>
+    <section class="questions-list">
+      ${questionsHtml}
     </section>
-
-    <section>
-      <div class="section-title">Detalle por pregunta</div>
-      <hr class="section-divider" />
-      ${htmlQuestions}
-    </section>
-  </main>
+  </div>
 </body>
 </html>`;
 
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     return res.send(html);
-  } catch (err) {
+  } catch (err: any) {
     console.error("REVIEW_PRINT_ERROR", err);
-    res
-      .status(500)
-      .send(
-        "Error al generar la revisión imprimible. Ver consola del servidor."
-      );
+    return res.status(500).send("Error generando la revisión para impresión.");
   }
 });
