@@ -74,7 +74,7 @@ model Question {
   text      String
   options   Json?
   answerKey Json?
-  answers     Answer[]
+
 
   points    Int      @default(1)
   createdAt DateTime @default(now()) // <-- agregado
@@ -114,8 +114,7 @@ model Answer {
   timeSpentMs Int      @default(0)
 
   attempt   Attempt  @relation(fields: [attemptId], references: [id])
-  question  Question @relation(fields: [questionId], references: [id])
-
+ 
   @@unique([attemptId, questionId])
 }
 

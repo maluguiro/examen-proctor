@@ -1362,6 +1362,9 @@ function serializeAnswerContent(kind: any, value: any): string | null {
       arr = value;
     } else if (value && Array.isArray((value as any).answers)) {
       arr = (value as any).answers;
+    } else if (typeof value === "string" || typeof value === "number") {
+      // FIX: Si viene un valor simple, lo metemos en array
+      arr = [value];
     }
 
     const normalized = arr.map((v) => String(v ?? "").trim());
@@ -1430,7 +1433,8 @@ examsRouter.post("/attempts/:id/submit", async (req, res) => {
     let score = 0;
 
     for (const a of arr) {
-      const q = byId.get(a.questionId);
+      const rawQid = (a as any).questionId;
+      const q = byId.get(String(rawQid));
       if (!q) continue;
 
       const pts = Number(q.points ?? 1) || 1;
@@ -1508,14 +1512,31 @@ examsRouter.post("/attempts/:id/submit", async (req, res) => {
       const storedContent = serializeAnswerContent(q.kind, a.value);
 
       try {
-        await prisma.answer.create({
-          data: {
-            attemptId: attempt.id,
-            questionId: q.id,
-            content: storedContent,
-            score: partial,
-          },
+        // FIX: Usar upsert manual (findFirst + update/create) para evitar errores de duplicados
+        const existingAns = await prisma.answer.findFirst({
+          where: { attemptId: attempt.id, questionId: q.id },
         });
+
+        if (existingAns) {
+          await prisma.answer.update({
+            where: { id: existingAns.id },
+            data: {
+              content: storedContent as any, // Cast explícito para Prisma JSON
+              score: partial,
+            },
+          });
+          // console.log(`[SUBMIT] Updated ans Q:${q.id}`, storedContent);
+        } else {
+          await prisma.answer.create({
+            data: {
+              attemptId: attempt.id,
+              questionId: q.id,
+              content: storedContent as any, // Cast explícito para Prisma JSON
+              score: partial,
+            },
+          });
+          // console.log(`[SUBMIT] Created ans Q:${q.id}`, storedContent);
+        }
       } catch (err) {
         console.error("ANSWER_CREATE_ERROR (no corta el submit):", {
           err,
