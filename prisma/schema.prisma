@@ -13,52 +13,53 @@ model User {
   id    String @id @default(cuid())
   email String @unique
   role  String // 'teacher' | 'student'
-  
-  // Auth básica + Perfil
-  name         String?   // nombre visible
-  passwordHash String?
-  createdAt    DateTime  @default(now())
 
-  teacherProfile TeacherProfile?
+  // Auth básica + Perfil
+  name         String? // nombre visible
+  passwordHash String?
+  createdAt    DateTime @default(now())
+
+  teacherProfile  TeacherProfile?
+  teacherCalendar TeacherCalendar?
 }
 
 model TeacherProfile {
-  id           String   @id @default(cuid())
-  userId       String   @unique
+  id           String @id @default(cuid())
+  userId       String @unique
   fullName     String
   // Array de { id, name, kind?, subjects: [{ id, name }] }
-  institutions Json     
-  
-  user         User     @relation(fields: [userId], references: [id])
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  institutions Json
+
+  user      User     @relation(fields: [userId], references: [id])
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
 
 model Exam {
-  id         String      @id @default(uuid())
+  id         String     @id @default(uuid())
   title      String
-  status     ExamStatus  @default(DRAFT)
-  updatedAt  DateTime    @updatedAt @default(now())
+  status     ExamStatus @default(DRAFT)
+  updatedAt  DateTime   @default(now()) @updatedAt
   startsAt   DateTime?
   endsAt     DateTime?
-  publicCode String      @unique
+  publicCode String     @unique
 
   // Duración: seguimos usando estos campos en la DB
-  durationMin  Int?   // viejo
-  durationMins Int?   // compatibilidad
+  durationMin  Int? // viejo
+  durationMins Int? // compatibilidad
 
-  lives         Int      @default(3)
-  pausesAllowed Boolean  @default(false)
-  forgiveLives  Boolean  @default(false)
+  lives         Int       @default(3)
+  pausesAllowed Boolean   @default(false)
+  forgiveLives  Boolean   @default(false)
   ownerId       String
-  createdAt     DateTime @default(now())
+  createdAt     DateTime  @default(now())
   expiresAt     DateTime?
 
   // 🔹 NUEVOS CAMPOS para la meta docente
-  teacherName String?    // ej: "Prof. Gómez"
-  university  String?    // ej: "Universidad X" 👈 NUEVO
-  subject     String?    // ej: "Matemática I"
-  gradingMode String     @default("auto") // 'auto' | 'manual'
+  teacherName String? // ej: "Prof. Gómez"
+  university  String? // ej: "Universidad X" 👈 NUEVO
+  subject     String? // ej: "Matemática I"
+  gradingMode String    @default("auto") // 'auto' | 'manual'
   maxScore    Int?
   openAt      DateTime?
 
@@ -66,55 +67,52 @@ model Exam {
   attempts  Attempt[]
 }
 
-
 model Question {
   id        String       @id @default(uuid())
   examId    String
-  kind        QuestionKind  @default(TEXT)
+  kind      QuestionKind @default(TEXT)
   text      String
   options   Json?
   answerKey Json?
 
-
-  points    Int      @default(1)
-  createdAt DateTime @default(now()) // <-- agregado
-  allowedKinds Json?   // p.ej. ["TRUE_FALSE","MCQ"] — si null o [], es MIXTO (todas)
+  points       Int      @default(1)
+  createdAt    DateTime @default(now()) // <-- agregado
+  allowedKinds Json? // p.ej. ["TRUE_FALSE","MCQ"] — si null o [], es MIXTO (todas)
 
   exam Exam @relation(fields: [examId], references: [id])
 }
 
-
 model Attempt {
-  id            String   @id @default(cuid())
+  id            String    @id @default(cuid())
   examId        String
   studentId     String
   studentName   String?
-  status        String   @default("in_progress") // in_progress | submitted
-  startAt       DateTime @default(now())
+  status        String    @default("in_progress") // in_progress | submitted
+  startAt       DateTime  @default(now())
   endAt         DateTime?
   score         Float?
-  livesUsed     Int      @default(0)
-  paused        Boolean  @default(false)
-  extraTimeSecs Int      @default(0)
-  questionOrder Json?    // orden de preguntas por alumno
+  livesUsed     Int       @default(0)
+  paused        Boolean   @default(false)
+  extraTimeSecs Int       @default(0)
+  questionOrder Json? // orden de preguntas por alumno
 
-  exam      Exam     @relation(fields: [examId], references: [id])
-  events    Event[]
-  answers   Answer[]
-  messages  Message[]
+  exam     Exam      @relation(fields: [examId], references: [id])
+  events   Event[]
+  answers  Answer[]
+  messages Message[]
 }
 
 model Answer {
   id          String   @id @default(cuid())
   attemptId   String
   questionId  String
-  content     Json?    // mcq: ["a","c"], tf: true/false, text: string
+  content     Json? // mcq: ["a","c"], tf: true/false, text: string
   isCorrect   Boolean?
   score       Float?
   timeSpentMs Int      @default(0)
 
-  attempt   Attempt  @relation(fields: [attemptId], references: [id])
- 
+  attempt Attempt @relation(fields: [attemptId], references: [id])
+
   @@unique([attemptId, questionId])
 }
 
@@ -126,18 +124,19 @@ model Event {
   ts        DateTime @default(now())
   meta      Json?
 
-  attempt   Attempt  @relation(fields: [attemptId], references: [id])
+  attempt Attempt @relation(fields: [attemptId], references: [id])
 }
 
 model Message {
   id        String   @id @default(cuid())
   attemptId String
-  from      String   // 'student' | 'teacher'
+  from      String // 'student' | 'teacher'
   text      String
   ts        DateTime @default(now())
 
-  attempt   Attempt  @relation(fields: [attemptId], references: [id])
+  attempt Attempt @relation(fields: [attemptId], references: [id])
 }
+
 // -----------------------------
 // ENUMS FALTANTES
 // -----------------------------
@@ -147,6 +146,7 @@ enum ExamStatus {
   OPEN   @map("open")
   CLOSED @map("closed")
 }
+
 enum QuestionKind {
   MULTIPLE_CHOICE @map("multiple_choice")
   TRUE_FALSE      @map("true_false")
@@ -160,4 +160,16 @@ model PasswordResetToken {
   userId    String
   expiresAt DateTime
   createdAt DateTime @default(now())
+}
+
+model TeacherCalendar {
+  id        String @id @default(cuid())
+  teacherId String @unique
+
+  events Json @default("[]")
+  tasks  Json @default("[]")
+
+  updatedAt DateTime @updatedAt
+
+  teacher User @relation(fields: [teacherId], references: [id], onDelete: Cascade)
 }

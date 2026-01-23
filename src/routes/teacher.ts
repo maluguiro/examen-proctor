@@ -122,6 +122,74 @@ teacherRouter.patch("/profile", async (req, res) => {
 });
 
 /**
+ * GET /api/teacher/calendar
+ * Devuelve el calendario (events + tasks) del docente logueado.
+ */
+teacherRouter.get("/calendar", async (req, res) => {
+    try {
+        const userId = req.user?.userId;
+        if (!userId) return res.status(401).json({ error: "UNAUTHORIZED" });
+
+        const calendar = await prisma.teacherCalendar.findUnique({
+            where: { teacherId: userId },
+        });
+
+        if (!calendar) {
+            return res.json({ events: [], tasks: [] });
+        }
+
+        return res.json({
+            events: Array.isArray(calendar.events) ? calendar.events : [],
+            tasks: Array.isArray(calendar.tasks) ? calendar.tasks : [],
+        });
+    } catch (err: any) {
+        console.error("GET_TEACHER_CALENDAR_ERROR", err);
+        return res.status(500).json({ error: err?.message || "INTERNAL_ERROR" });
+    }
+});
+
+/**
+ * PUT /api/teacher/calendar
+ * Body: { events, tasks }
+ */
+teacherRouter.put("/calendar", async (req, res) => {
+    try {
+        const userId = req.user?.userId;
+        if (!userId) return res.status(401).json({ error: "UNAUTHORIZED" });
+
+        const { events, tasks } = req.body;
+
+        if (!Array.isArray(events)) {
+            return res.status(400).json({ error: "EVENTS_MUST_BE_ARRAY" });
+        }
+        if (!Array.isArray(tasks)) {
+            return res.status(400).json({ error: "TASKS_MUST_BE_ARRAY" });
+        }
+
+        const calendar = await prisma.teacherCalendar.upsert({
+            where: { teacherId: userId },
+            create: {
+                teacherId: userId,
+                events,
+                tasks,
+            },
+            update: {
+                events,
+                tasks,
+            },
+        });
+
+        return res.json({
+            events: Array.isArray(calendar.events) ? calendar.events : [],
+            tasks: Array.isArray(calendar.tasks) ? calendar.tasks : [],
+        });
+    } catch (err: any) {
+        console.error("PUT_TEACHER_CALENDAR_ERROR", err);
+        return res.status(500).json({ error: err?.message || "INTERNAL_ERROR" });
+    }
+});
+
+/**
  * GET /api/teacher/exams
  * Lista los exámenes creados por el docente logueado.
  */
