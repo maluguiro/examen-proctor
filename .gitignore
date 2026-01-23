@@ -3,3 +3,6 @@ node_modules
 .env
 
 /generated/prisma
+# Local Prisma DB (no commitear)
+prisma/dev.db
+prisma/*.db
