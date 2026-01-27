@@ -16,7 +16,19 @@ import { prisma } from "./prisma";
 import { ExamStatus } from "@prisma/client";
 
 const app = express();
-app.use(cors());
+const allowedOrigins = new Set<string>(["http://localhost:3000"]);
+if (process.env.CORS_ORIGIN) {
+  allowedOrigins.add(process.env.CORS_ORIGIN);
+}
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.has(origin)) return callback(null, true);
+      return callback(new Error("CORS_NOT_ALLOWED"));
+    },
+  })
+);
 app.use(express.json());
 
 // Montamos AUTH y TEACHER
@@ -55,6 +67,7 @@ async function generateUniquePublicCode(): Promise<string> {
 }
 
 // ✅ HEALTHCHECK
+app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
 
 // ✅ CREAR EXAMEN
@@ -195,7 +208,7 @@ app.post("/api/exams", optionalAuthMiddleware, async (req, res) => {
 app.use("/api", examsRouter);
 app.use("/api", questionsRouter);
 
-const PORT = process.env.PORT ? Number(process.env.PORT) : 3001;
+const PORT = Number(process.env.PORT ?? 3001);
 app.listen(PORT, () => {
   console.log(`API on :${PORT}`);
 });
