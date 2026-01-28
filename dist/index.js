@@ -31,6 +31,11 @@ app.use((0, cors_1.default)({
     },
 }));
 app.use(express_1.default.json());
+// Compat: puente /auth/* -> /api/auth/*
+app.use("/auth", (req, res) => {
+    const target = "/api" + req.originalUrl;
+    return res.redirect(307, target);
+});
 // Montamos AUTH y TEACHER
 app.use("/api/auth", auth_1.authRouter);
 app.use("/api/teacher", authMiddleware_1.authMiddleware, teacher_1.teacherRouter);

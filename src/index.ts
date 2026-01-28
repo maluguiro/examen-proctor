@@ -31,6 +31,12 @@ app.use(
 );
 app.use(express.json());
 
+// Compat: puente /auth/* -> /api/auth/*
+app.use("/auth", (req, res) => {
+  const target = "/api" + req.originalUrl;
+  return res.redirect(307, target);
+});
+
 // Montamos AUTH y TEACHER
 app.use("/api/auth", authRouter);
 app.use("/api/teacher", authMiddleware, teacherRouter);
