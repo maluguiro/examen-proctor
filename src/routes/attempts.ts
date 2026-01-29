@@ -17,18 +17,18 @@ attempts.patch("/:id/lives", async (req, res) => {
 
   const att = await prisma.attempt.findUnique({
     where: { id },
-    include: { Exam: true },
+    include: { exam: true },
   });
   if (!att) return res.status(404).json({ error: "ATTEMPT_NOT_FOUND" });
 
-  let newLives = att.lives + (op === "increment" ? 1 : -1);
+  let newLives = att.livesUsed + (op === "increment" ? 1 : -1);
   if (newLives < 0) newLives = 0;
   // 👉 límite superior según Exam.lives (no maxLives)
-  if (newLives > att.Exam.lives) newLives = att.Exam.lives;
+  if (newLives > att.exam.lives) newLives = att.exam.lives;
 
   const updated = await prisma.attempt.update({
     where: { id },
-    data: { lives: newLives },
+    data: { livesUsed: newLives },
   });
 
   await publishEvent(att.examId, {
@@ -54,7 +54,7 @@ attempts.post("/:id/events", async (req, res) => {
 
   const attempt = await prisma.attempt.findUnique({
     where: { id },
-    select: { id: true, examId: true, lives: true, status: true },
+    select: { id: true, examId: true, livesUsed: true, status: true },
   });
   if (!attempt) return res.status(404).json({ error: "ATTEMPT_NOT_FOUND" });
 
@@ -62,9 +62,9 @@ attempts.post("/:id/events", async (req, res) => {
   // para no descontar vidas ni registrar fraude post-entregado.
   if (attempt.status !== "in_progress") {
     return res.json({
-      livesLeft: attempt.lives,
+      livesLeft: attempt.livesUsed,
       status: attempt.status,
-      autoSubmitted: attempt.status === "SUBMITTED" || attempt.lives === 0,
+      autoSubmitted: attempt.status === "SUBMITTED" || attempt.livesUsed === 0,
       ignored: true,
     });
   }
@@ -87,10 +87,13 @@ attempts.post("/:id/events", async (req, res) => {
     "FULLSCREEN_EXIT",
   ]);
 
-  let lives = attempt.lives;
+  let lives = attempt.livesUsed;
   if (PENALTY.has(type)) {
     lives = Math.max(lives - 1, 0);
-    await prisma.attempt.update({ where: { id: attempt.id }, data: { lives } });
+    await prisma.attempt.update({
+      where: { id: attempt.id },
+      data: { livesUsed: lives },
+    });
     await publishEvent(attempt.examId, {
       type: "LIFE_LOST",
       attemptId: attempt.id,

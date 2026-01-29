@@ -4,6 +4,7 @@ import { Router } from "express";
 import { prisma } from "../prisma";
 import crypto from "crypto";
 import PDFDocument from "pdfkit";
+import { Prisma } from "@prisma/client";
 import { authMiddleware } from "../authMiddleware"; // Necesario para asegurar user en request si se usa en rutas protegidas explícitas
 
 export const examsRouter = Router();
@@ -832,7 +833,7 @@ examsRouter.post("/exams/:code/attempts/mock", async (req, res) => {
         livesUsed: 0,
         paused: false,
         extraTimeSecs: 0,
-        questionOrder: null,
+        questionOrder: Prisma.DbNull,
       },
       select: {
         id: true,
@@ -974,7 +975,7 @@ examsRouter.post("/exams/:code/attempts/start", async (req, res) => {
         livesUsed: 0,
         paused: false,
         extraTimeSecs: 0,
-        questionOrder: null,
+        questionOrder: Prisma.DbNull,
       },
       select: {
         id: true,
@@ -1257,7 +1258,7 @@ examsRouter.post("/attempts/:id/antifraud", async (req, res) => {
         attemptId: attempt.id,
         type: "ANTIFRAUD",
         reason: normalizedType,
-        meta: meta ?? null,
+        meta: meta ?? Prisma.DbNull,
       },
     });
 
@@ -1824,7 +1825,7 @@ examsRouter.post("/s/attempt/:id/event", async (req, res) => {
           attemptId: attempt.id,
           type: "ANTIFRAUD",
           reason: normalizedType, // ej: BLUR, COPY, FULLSCREEN_EXIT
-          meta: meta ?? null,
+          meta: meta ?? Prisma.DbNull,
         },
       });
     } catch (err) {
