@@ -18,7 +18,10 @@ import { ExamStatus } from "@prisma/client";
 const app = express();
 const allowedOrigins = new Set<string>(["http://localhost:3000"]);
 if (process.env.CORS_ORIGIN) {
-  allowedOrigins.add(process.env.CORS_ORIGIN);
+  process.env.CORS_ORIGIN.split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean)
+    .forEach((origin) => allowedOrigins.add(origin));
 }
 app.use(
   cors({

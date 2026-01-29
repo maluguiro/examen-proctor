@@ -19,7 +19,10 @@ const prisma_1 = require("./prisma");
 const app = (0, express_1.default)();
 const allowedOrigins = new Set(["http://localhost:3000"]);
 if (process.env.CORS_ORIGIN) {
-    allowedOrigins.add(process.env.CORS_ORIGIN);
+    process.env.CORS_ORIGIN.split(",")
+        .map((origin) => origin.trim())
+        .filter(Boolean)
+        .forEach((origin) => allowedOrigins.add(origin));
 }
 app.use((0, cors_1.default)({
     origin: (origin, callback) => {
