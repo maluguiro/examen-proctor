@@ -92,6 +92,8 @@ app.get("/api/exams", async (_req, res) => {
                 durationMin: true,
                 durationMins: true,
                 lives: true,
+                university: true,
+                subject: true,
             },
         });
         // Adaptamos lo que viene de la DB al formato que espera el frontend
@@ -107,6 +109,8 @@ app.get("/api/exams", async (_req, res) => {
                 // 👇 este nombre sí lo usamos hacia el front
                 durationMinutes,
                 lives: e.lives,
+                university: e.university ?? null,
+                subject: e.subject ?? null,
             };
         });
         res.json(shaped);
@@ -152,7 +156,15 @@ app.post("/api/exams", authMiddleware_1.optionalAuthMiddleware, async (req, res)
             // Podríamos buscar el perfil, pero por performance quizás baste con lo que venga en el body o default
         }
         // Campos adicionales (university, subject)
-        const subject = body.userSubject ? String(body.userSubject).trim() : null;
+        const university = body.university !== undefined && body.university !== null
+            ? String(body.university).trim() || null
+            : null;
+        const subjectRaw = body.subject !== undefined && body.subject !== null
+            ? body.subject
+            : body.userSubject;
+        const subject = subjectRaw !== undefined && subjectRaw !== null
+            ? String(subjectRaw).trim() || null
+            : null;
         const publicCode = await generateExamPublicCode();
         const exam = await prisma_1.prisma.exam.create({
             data: {
@@ -163,6 +175,7 @@ app.post("/api/exams", authMiddleware_1.optionalAuthMiddleware, async (req, res)
                 durationMins: durationMin,
                 ownerId: ownerId ?? process.env.DEFAULT_OWNER_ID ?? "docente-local",
                 publicCode,
+                university,
                 subject,
                 teacherName,
             },

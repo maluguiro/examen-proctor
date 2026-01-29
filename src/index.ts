@@ -97,6 +97,8 @@ app.get("/api/exams", async (_req, res) => {
         durationMin: true,
         durationMins: true,
         lives: true,
+        university: true,
+        subject: true,
       },
     });
 
@@ -115,6 +117,8 @@ app.get("/api/exams", async (_req, res) => {
         // 👇 este nombre sí lo usamos hacia el front
         durationMinutes,
         lives: e.lives,
+        university: e.university ?? null,
+        subject: e.subject ?? null,
       };
     });
 
@@ -173,7 +177,18 @@ app.post("/api/exams", optionalAuthMiddleware, async (req, res) => {
     }
 
     // Campos adicionales (university, subject)
-    const subject = body.userSubject ? String(body.userSubject).trim() : null;
+    const university =
+      body.university !== undefined && body.university !== null
+        ? String(body.university).trim() || null
+        : null;
+    const subjectRaw =
+      body.subject !== undefined && body.subject !== null
+        ? body.subject
+        : body.userSubject;
+    const subject =
+      subjectRaw !== undefined && subjectRaw !== null
+        ? String(subjectRaw).trim() || null
+        : null;
 
     const publicCode = await generateExamPublicCode();
 
@@ -186,6 +201,7 @@ app.post("/api/exams", optionalAuthMiddleware, async (req, res) => {
         durationMins: durationMin,
         ownerId: ownerId ?? process.env.DEFAULT_OWNER_ID ?? "docente-local",
         publicCode,
+        university,
         subject,
         teacherName,
       },
