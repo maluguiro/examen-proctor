@@ -194,7 +194,7 @@ async function ensureQuestionLite() {
       choices   TEXT,          -- JSON string (solo MCQ / TRUE_FALSE)
       answer    TEXT,          -- JSON string (respuesta correcta)
       points    INTEGER NOT NULL DEFAULT 1,
-      createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      createdAt TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY(examId) REFERENCES "Exam"(id) ON DELETE CASCADE
     );
   `);
@@ -208,7 +208,7 @@ async function ensureExamChatTable() {
       "authorName" TEXT NOT NULL,
       "message" TEXT NOT NULL,
       "broadcast" INTEGER NOT NULL DEFAULT 0,
-      "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      "createdAt" TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY("examId") REFERENCES "Exam"("id") ON DELETE CASCADE
     );
   `);

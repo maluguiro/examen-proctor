@@ -19,7 +19,7 @@ async function ensureTable() {
       choices TEXT,                  -- JSON string (solo MCQ / TRUE_FALSE)
       answer TEXT,                   -- JSON string (respuesta correcta o forma de corregir)
       points INTEGER NOT NULL DEFAULT 1,
-      createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      createdAt TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
       -- índices útiles
       FOREIGN KEY(examId) REFERENCES "Exam"(id) ON DELETE CASCADE
@@ -32,19 +32,19 @@ async function resolveExamId(codeRaw) {
     if (!code)
         return null;
     // por publicCode exacto
-    let rows = await prisma_1.prisma.$queryRawUnsafe(`SELECT id FROM "Exam" WHERE publicCode = ? LIMIT 1`, code);
+    let rows = await prisma_1.prisma.$queryRawUnsafe(`SELECT id FROM "Exam" WHERE "publicCode" = $1 LIMIT 1`, code);
     if (rows?.[0])
         return rows[0];
     // por id exacto
-    rows = await prisma_1.prisma.$queryRawUnsafe(`SELECT id FROM "Exam" WHERE id = ? LIMIT 1`, code);
+    rows = await prisma_1.prisma.$queryRawUnsafe(`SELECT id FROM "Exam" WHERE id = $1 LIMIT 1`, code);
     if (rows?.[0])
         return rows[0];
     // por prefijo de id
-    rows = await prisma_1.prisma.$queryRawUnsafe(`SELECT id FROM "Exam" WHERE id LIKE ? LIMIT 1`, `${code}%`);
+    rows = await prisma_1.prisma.$queryRawUnsafe(`SELECT id FROM "Exam" WHERE id LIKE $1 LIMIT 1`, `${code}%`);
     if (rows?.[0])
         return rows[0];
     // por título exacto (case-insensitive)
-    rows = await prisma_1.prisma.$queryRawUnsafe(`SELECT id FROM "Exam" WHERE LOWER(title) = LOWER(?) LIMIT 1`, code);
+    rows = await prisma_1.prisma.$queryRawUnsafe(`SELECT id FROM "Exam" WHERE LOWER(title) = LOWER($1) LIMIT 1`, code);
     if (rows?.[0])
         return rows[0];
     return null;
@@ -58,7 +58,7 @@ exports.questionsRouter.get("/exams/:code/questions", async (req, res) => {
             return res.status(404).json({ error: "EXAM_NOT_FOUND" });
         const list = await prisma_1.prisma.$queryRawUnsafe(`SELECT id, examId, kind, stem, choices, answer, points, createdAt
        FROM "QuestionLite"
-       WHERE examId = ?
+       WHERE examId = $1
        ORDER BY createdAt ASC`, exam.id);
         // Parseo JSON de convenience
         const data = (list || []).map((q) => ({
@@ -119,9 +119,9 @@ exports.questionsRouter.post("/exams/:code/questions", async (req, res) => {
         }
         const id = crypto_1.default.randomUUID();
         await prisma_1.prisma.$executeRawUnsafe(`INSERT INTO "QuestionLite" (id, examId, kind, stem, choices, answer, points)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`, id, exam.id, kind, stem.trim(), choicesStr, answerStr, Number(points) || 1);
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`, id, exam.id, kind, stem.trim(), choicesStr, answerStr, Number(points) || 1);
         const row = await prisma_1.prisma.$queryRawUnsafe(`SELECT id, examId, kind, stem, choices, answer, points, createdAt
-       FROM "QuestionLite" WHERE id = ?`, id);
+       FROM "QuestionLite" WHERE id = $1`, id);
         const q = row?.[0];
         if (!q)
             return res.status(500).json({ error: "NO_INSERTADO" });
@@ -142,13 +142,13 @@ exports.questionsRouter.put("/questions/:id", async (req, res) => {
         const { id } = req.params;
         const { stem, choices, answer, points } = req.body ?? {};
         const rows = await prisma_1.prisma.$executeRawUnsafe(`UPDATE "QuestionLite"
-       SET stem = COALESCE(?, stem),
-           choices = COALESCE(?, choices),
-           answer = COALESCE(?, answer),
-           points = COALESCE(?, points)
-       WHERE id = ?`, stem != null ? String(stem).trim() : null, choices != null ? JSON.stringify(choices) : null, answer != null ? JSON.stringify(answer) : null, Number.isFinite(points) ? Number(points) : null, id);
+       SET stem = COALESCE($1, stem),
+           choices = COALESCE($2, choices),
+           answer = COALESCE($3, answer),
+           points = COALESCE($4, points)
+       WHERE id = $5`, stem != null ? String(stem).trim() : null, choices != null ? JSON.stringify(choices) : null, answer != null ? JSON.stringify(answer) : null, Number.isFinite(points) ? Number(points) : null, id);
         const row = await prisma_1.prisma.$queryRawUnsafe(`SELECT id, examId, kind, stem, choices, answer, points, createdAt
-       FROM "QuestionLite" WHERE id = ?`, id);
+       FROM "QuestionLite" WHERE id = $1`, id);
         const q = row?.[0];
         if (!q)
             return res.status(404).json({ error: "QUESTION_NOT_FOUND" });
@@ -167,7 +167,7 @@ exports.questionsRouter.delete("/questions/:id", async (req, res) => {
     try {
         await ensureTable();
         const { id } = req.params;
-        const rows = await prisma_1.prisma.$executeRawUnsafe(`DELETE FROM "QuestionLite" WHERE id = ?`, id);
+        const rows = await prisma_1.prisma.$executeRawUnsafe(`DELETE FROM "QuestionLite" WHERE id = $1`, id);
         res.json({ ok: true, deleted: rows });
     }
     catch (e) {
