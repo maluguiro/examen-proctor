@@ -1,10 +1,79 @@
-import { Router } from "express";
+﻿import { Router } from "express";
 import { prisma } from "../prisma";
 // authMiddleware se aplica en index.ts antes de llamar a este router, 
 // así que aquí ya tenemos req.user asegurado.
 // Pero si queremos ser explícitos: se puede importar tipos si hace falta.
 
 export const teacherRouter = Router();
+type InstitutionInput = {
+    id?: unknown;
+    name?: unknown;
+    kind?: unknown;
+    subjects?: unknown;
+};
+
+type SubjectInput = {
+    id?: unknown;
+    name?: unknown;
+};
+
+function makeId(prefix: string) {
+    const rand = Math.random().toString(36).slice(2, 8);
+    return `${prefix}_${Date.now()}_${rand}`;
+}
+
+function normalizeInstitutions(input: unknown) {
+    if (!Array.isArray(input)) return [];
+
+    const institutions: any[] = [];
+    const seenInstitutions = new Set<string>();
+
+    for (const raw of input) {
+        const inst = (raw ?? {}) as InstitutionInput;
+        const name = typeof inst.name === "string" ? inst.name.trim() : "";
+        if (!name) continue;
+
+        const nameKey = name.toLowerCase();
+        if (seenInstitutions.has(nameKey)) continue;
+        seenInstitutions.add(nameKey);
+
+        const subjectsRaw = inst.subjects;
+        const subjectsArray = Array.isArray(subjectsRaw) ? subjectsRaw : [];
+        const subjects: any[] = [];
+        const seenSubjects = new Set<string>();
+
+        for (const s of subjectsArray) {
+            const subj = (s ?? {}) as SubjectInput;
+            const subjName =
+                typeof subj.name === "string" ? subj.name.trim() : "";
+            if (!subjName) continue;
+
+            const subjKey = subjName.toLowerCase();
+            if (seenSubjects.has(subjKey)) continue;
+            seenSubjects.add(subjKey);
+
+            subjects.push({
+                id:
+                    typeof subj.id === "string" && subj.id.trim()
+                        ? subj.id.trim()
+                        : makeId("subj"),
+                name: subjName,
+            });
+        }
+
+        institutions.push({
+            id:
+                typeof inst.id === "string" && inst.id.trim()
+                    ? inst.id.trim()
+                    : makeId("inst"),
+            name,
+            kind: inst.kind,
+            subjects,
+        });
+    }
+
+    return institutions;
+}
 
 /**
  * GET /api/teacher/profile
@@ -35,7 +104,33 @@ teacherRouter.get("/profile", async (req, res) => {
             });
         }
 
-        return res.json({ profile });
+        const normalizedInstitutions = normalizeInstitutions(
+            (profile as any).institutions
+        );
+
+        const currentInstitutions = Array.isArray((profile as any).institutions)
+            ? (profile as any).institutions
+            : [];
+        const currentStr = JSON.stringify(currentInstitutions);
+        const normalizedStr = JSON.stringify(normalizedInstitutions);
+
+        if (currentStr !== normalizedStr) {
+            try {
+                profile = await prisma.teacherProfile.update({
+                    where: { userId },
+                    data: { institutions: normalizedInstitutions },
+                });
+            } catch (e) {
+                console.error("NORMALIZE_PROFILE_ERROR", e);
+            }
+        }
+
+        return res.json({
+            profile: {
+                ...profile,
+                institutions: normalizedInstitutions,
+            },
+        });
     } catch (err: any) {
         console.error("GET_PROFILE_ERROR", err);
         return res.status(500).json({ error: err?.message || "INTERNAL_ERROR" });
@@ -59,11 +154,8 @@ teacherRouter.put("/profile", async (req, res) => {
         }
 
         if (institutions !== undefined) {
-            // Se podría validar estructura, por ahora confiamos sea array
-            if (!Array.isArray(institutions)) {
-                return res.status(400).json({ error: "INSTITUTIONS_MUST_BE_ARRAY" });
-            }
-            dataToUpdate.institutions = institutions;
+            const normalizedInstitutions = normalizeInstitutions(institutions);
+            dataToUpdate.institutions = normalizedInstitutions;
         }
 
         // Upsert para asegurar
@@ -77,7 +169,16 @@ teacherRouter.put("/profile", async (req, res) => {
             update: dataToUpdate,
         });
 
-        return res.json({ profile: updated });
+        const normalizedInstitutions = normalizeInstitutions(
+            (updated as any).institutions
+        );
+
+        return res.json({
+            profile: {
+                ...updated,
+                institutions: normalizedInstitutions,
+            },
+        });
     } catch (err: any) {
         console.error("UPDATE_PROFILE_ERROR", err);
         return res.status(500).json({ error: err?.message || "INTERNAL_ERROR" });
@@ -101,11 +202,8 @@ teacherRouter.patch("/profile", async (req, res) => {
             data.fullName = String(fullName).trim();
         }
         if (institutions !== undefined) {
-            // Validación básica de array
-            if (!Array.isArray(institutions)) {
-                return res.status(400).json({ error: "INSTITUTIONS_MUST_BE_ARRAY" });
-            }
-            data.institutions = institutions;
+            const normalizedInstitutions = normalizeInstitutions(institutions);
+            data.institutions = normalizedInstitutions;
         }
 
         // Se asume que el perfil existe (creado al registrarse o en GET previo)
@@ -114,13 +212,21 @@ teacherRouter.patch("/profile", async (req, res) => {
             data,
         });
 
-        return res.json({ profile: updated });
+        const normalizedInstitutions = normalizeInstitutions(
+            (updated as any).institutions
+        );
+
+        return res.json({
+            profile: {
+                ...updated,
+                institutions: normalizedInstitutions,
+            },
+        });
     } catch (err: any) {
         console.error("PATCH_PROFILE_ERROR", err);
         return res.status(500).json({ error: err?.message || "INTERNAL_ERROR" });
     }
 });
-
 /**
  * GET /api/teacher/calendar
  * Devuelve el calendario (events + tasks) del docente logueado.
@@ -227,3 +333,6 @@ teacherRouter.get("/exams", async (req, res) => {
         return res.status(500).json({ error: err?.message || "INTERNAL_ERROR" });
     }
 });
+
+
+

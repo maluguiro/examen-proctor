@@ -7,6 +7,55 @@ const prisma_1 = require("../prisma");
 // así que aquí ya tenemos req.user asegurado.
 // Pero si queremos ser explícitos: se puede importar tipos si hace falta.
 exports.teacherRouter = (0, express_1.Router)();
+function makeId(prefix) {
+    const rand = Math.random().toString(36).slice(2, 8);
+    return `${prefix}_${Date.now()}_${rand}`;
+}
+function normalizeInstitutions(input) {
+    if (!Array.isArray(input))
+        return [];
+    const institutions = [];
+    const seenInstitutions = new Set();
+    for (const raw of input) {
+        const inst = (raw ?? {});
+        const name = typeof inst.name === "string" ? inst.name.trim() : "";
+        if (!name)
+            continue;
+        const nameKey = name.toLowerCase();
+        if (seenInstitutions.has(nameKey))
+            continue;
+        seenInstitutions.add(nameKey);
+        const subjectsRaw = inst.subjects;
+        const subjectsArray = Array.isArray(subjectsRaw) ? subjectsRaw : [];
+        const subjects = [];
+        const seenSubjects = new Set();
+        for (const s of subjectsArray) {
+            const subj = (s ?? {});
+            const subjName = typeof subj.name === "string" ? subj.name.trim() : "";
+            if (!subjName)
+                continue;
+            const subjKey = subjName.toLowerCase();
+            if (seenSubjects.has(subjKey))
+                continue;
+            seenSubjects.add(subjKey);
+            subjects.push({
+                id: typeof subj.id === "string" && subj.id.trim()
+                    ? subj.id.trim()
+                    : makeId("subj"),
+                name: subjName,
+            });
+        }
+        institutions.push({
+            id: typeof inst.id === "string" && inst.id.trim()
+                ? inst.id.trim()
+                : makeId("inst"),
+            name,
+            kind: inst.kind,
+            subjects,
+        });
+    }
+    return institutions;
+}
 /**
  * GET /api/teacher/profile
  * Devuelve el perfil del docente logueado.
@@ -33,7 +82,29 @@ exports.teacherRouter.get("/profile", async (req, res) => {
                 },
             });
         }
-        return res.json({ profile });
+        const normalizedInstitutions = normalizeInstitutions(profile.institutions);
+        const currentInstitutions = Array.isArray(profile.institutions)
+            ? profile.institutions
+            : [];
+        const currentStr = JSON.stringify(currentInstitutions);
+        const normalizedStr = JSON.stringify(normalizedInstitutions);
+        if (currentStr !== normalizedStr) {
+            try {
+                profile = await prisma_1.prisma.teacherProfile.update({
+                    where: { userId },
+                    data: { institutions: normalizedInstitutions },
+                });
+            }
+            catch (e) {
+                console.error("NORMALIZE_PROFILE_ERROR", e);
+            }
+        }
+        return res.json({
+            profile: {
+                ...profile,
+                institutions: normalizedInstitutions,
+            },
+        });
     }
     catch (err) {
         console.error("GET_PROFILE_ERROR", err);
@@ -55,11 +126,8 @@ exports.teacherRouter.put("/profile", async (req, res) => {
             dataToUpdate.fullName = String(fullName).trim();
         }
         if (institutions !== undefined) {
-            // Se podría validar estructura, por ahora confiamos sea array
-            if (!Array.isArray(institutions)) {
-                return res.status(400).json({ error: "INSTITUTIONS_MUST_BE_ARRAY" });
-            }
-            dataToUpdate.institutions = institutions;
+            const normalizedInstitutions = normalizeInstitutions(institutions);
+            dataToUpdate.institutions = normalizedInstitutions;
         }
         // Upsert para asegurar
         const updated = await prisma_1.prisma.teacherProfile.upsert({
@@ -71,7 +139,13 @@ exports.teacherRouter.put("/profile", async (req, res) => {
             },
             update: dataToUpdate,
         });
-        return res.json({ profile: updated });
+        const normalizedInstitutions = normalizeInstitutions(updated.institutions);
+        return res.json({
+            profile: {
+                ...updated,
+                institutions: normalizedInstitutions,
+            },
+        });
     }
     catch (err) {
         console.error("UPDATE_PROFILE_ERROR", err);
@@ -94,18 +168,21 @@ exports.teacherRouter.patch("/profile", async (req, res) => {
             data.fullName = String(fullName).trim();
         }
         if (institutions !== undefined) {
-            // Validación básica de array
-            if (!Array.isArray(institutions)) {
-                return res.status(400).json({ error: "INSTITUTIONS_MUST_BE_ARRAY" });
-            }
-            data.institutions = institutions;
+            const normalizedInstitutions = normalizeInstitutions(institutions);
+            data.institutions = normalizedInstitutions;
         }
         // Se asume que el perfil existe (creado al registrarse o en GET previo)
         const updated = await prisma_1.prisma.teacherProfile.update({
             where: { userId },
             data,
         });
-        return res.json({ profile: updated });
+        const normalizedInstitutions = normalizeInstitutions(updated.institutions);
+        return res.json({
+            profile: {
+                ...updated,
+                institutions: normalizedInstitutions,
+            },
+        });
     }
     catch (err) {
         console.error("PATCH_PROFILE_ERROR", err);
