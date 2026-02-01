@@ -8,23 +8,61 @@ const express_1 = require("express");
 const prisma_1 = require("../prisma");
 const crypto_1 = __importDefault(require("crypto"));
 exports.questionsRouter = (0, express_1.Router)();
+const globalAny = globalThis;
+async function getLiteColumns(tableName) {
+    const rows = await prisma_1.prisma.$queryRawUnsafe(`
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND lower(table_name) = lower($1)
+    ORDER BY ordinal_position
+  `, tableName);
+    return new Set((rows ?? []).map((r) => String(r.column_name)));
+}
+async function logLiteSchemaOnce() {
+    if (globalAny.__liteSchemaLogged)
+        return;
+    globalAny.__liteSchemaLogged = true;
+    try {
+        const questionCols = await getLiteColumns("QuestionLite");
+        const chatCols = await getLiteColumns("ExamChatLite");
+        console.log("LITE_SCHEMA", {
+            QuestionLite: Array.from(questionCols),
+            ExamChatLite: Array.from(chatCols),
+        });
+    }
+    catch (e) {
+        console.error("LITE_SCHEMA_LOG_ERROR", e);
+    }
+}
+async function repairQuestionLiteSchema() {
+    const cols = await getLiteColumns("QuestionLite");
+    if (cols.has("examid") && !cols.has("examId")) {
+        await prisma_1.prisma.$executeRawUnsafe(`ALTER TABLE "QuestionLite" RENAME COLUMN examid TO "examId";`);
+    }
+    if (cols.has("createdat") && !cols.has("createdAt")) {
+        await prisma_1.prisma.$executeRawUnsafe(`ALTER TABLE "QuestionLite" RENAME COLUMN createdat TO "createdAt";`);
+    }
+}
 /** Asegura que exista la tabla QuestionLite (sin Prisma) */
 async function ensureTable() {
     await prisma_1.prisma.$executeRawUnsafe(`
     CREATE TABLE IF NOT EXISTS "QuestionLite" (
       id TEXT PRIMARY KEY,
-      examId TEXT NOT NULL,
+      "examId" TEXT NOT NULL,
       kind TEXT NOT NULL,            -- 'MCQ' | 'TRUE_FALSE' | 'SHORT_TEXT' | 'FILL_IN'
       stem TEXT NOT NULL,            -- enunciado
       choices TEXT,                  -- JSON string (solo MCQ / TRUE_FALSE)
       answer TEXT,                   -- JSON string (respuesta correcta o forma de corregir)
       points INTEGER NOT NULL DEFAULT 1,
-      createdAt TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      "createdAt" TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
       -- índices útiles
-      FOREIGN KEY(examId) REFERENCES "Exam"(id) ON DELETE CASCADE
+      FOREIGN KEY("examId") REFERENCES "Exam"(id) ON DELETE CASCADE
     );
   `);
+    await repairQuestionLiteSchema();
+    await logLiteSchemaOnce();
 }
 /** Resuelve un examen por publicCode / id / prefijo / título */
 async function resolveExamId(codeRaw) {
@@ -56,10 +94,10 @@ exports.questionsRouter.get("/exams/:code/questions", async (req, res) => {
         const exam = await resolveExamId(req.params.code);
         if (!exam)
             return res.status(404).json({ error: "EXAM_NOT_FOUND" });
-        const list = await prisma_1.prisma.$queryRawUnsafe(`SELECT id, examId, kind, stem, choices, answer, points, createdAt
+        const list = await prisma_1.prisma.$queryRawUnsafe(`SELECT id, "examId", kind, stem, choices, answer, points, "createdAt"
        FROM "QuestionLite"
-       WHERE examId = $1
-       ORDER BY createdAt ASC`, exam.id);
+       WHERE "examId" = $1
+       ORDER BY "createdAt" ASC`, exam.id);
         // Parseo JSON de convenience
         const data = (list || []).map((q) => ({
             ...q,
@@ -120,7 +158,7 @@ exports.questionsRouter.post("/exams/:code/questions", async (req, res) => {
         const id = crypto_1.default.randomUUID();
         await prisma_1.prisma.$executeRawUnsafe(`INSERT INTO "QuestionLite" (id, examId, kind, stem, choices, answer, points)
        VALUES ($1, $2, $3, $4, $5, $6, $7)`, id, exam.id, kind, stem.trim(), choicesStr, answerStr, Number(points) || 1);
-        const row = await prisma_1.prisma.$queryRawUnsafe(`SELECT id, examId, kind, stem, choices, answer, points, createdAt
+        const row = await prisma_1.prisma.$queryRawUnsafe(`SELECT id, "examId", kind, stem, choices, answer, points, "createdAt"
        FROM "QuestionLite" WHERE id = $1`, id);
         const q = row?.[0];
         if (!q)
@@ -147,7 +185,7 @@ exports.questionsRouter.put("/questions/:id", async (req, res) => {
            answer = COALESCE($3, answer),
            points = COALESCE($4, points)
        WHERE id = $5`, stem != null ? String(stem).trim() : null, choices != null ? JSON.stringify(choices) : null, answer != null ? JSON.stringify(answer) : null, Number.isFinite(points) ? Number(points) : null, id);
-        const row = await prisma_1.prisma.$queryRawUnsafe(`SELECT id, examId, kind, stem, choices, answer, points, createdAt
+        const row = await prisma_1.prisma.$queryRawUnsafe(`SELECT id, "examId", kind, stem, choices, answer, points, "createdAt"
        FROM "QuestionLite" WHERE id = $1`, id);
         const q = row?.[0];
         if (!q)
