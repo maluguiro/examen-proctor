@@ -539,11 +539,17 @@ exports.examsRouter.put("/exams/:code/meta", async (req, res) => {
  * Usado por el TABLERO del docente.
  * Devuelve intentos con vidas, pausa y violaciones (a partir de Event).
  */
-exports.examsRouter.get("/exams/:code/attempts", async (req, res) => {
+exports.examsRouter.get("/exams/:code/attempts", authMiddleware_1.authMiddleware, async (req, res) => {
     try {
+        const userId = req.user?.userId;
+        if (!userId)
+            return res.status(401).json({ error: "UNAUTHORIZED" });
         const exam = await findExamByCode(req.params.code);
         if (!exam)
             return res.status(404).json({ error: "EXAM_NOT_FOUND" });
+        if (exam.ownerId && exam.ownerId !== userId) {
+            return res.status(403).json({ error: "FORBIDDEN" });
+        }
         const attempts = await prisma_1.prisma.attempt.findMany({
             where: { examId: exam.id },
             orderBy: { startAt: "asc" },
@@ -620,6 +626,17 @@ exports.examsRouter.get("/exams/:code/attempts", async (req, res) => {
                 finishedAt: a.endAt ? a.endAt.toISOString() : null,
             };
         });
+        if (String(req.query.view || "").toLowerCase() === "bandeja") {
+            const minimal = attempts.map((a) => ({
+                id: a.id,
+                studentName: a.studentName || "(sin nombre)",
+                studentEmail: null,
+                submittedAt: a.endAt ?? null,
+                status: a.status ?? "in_progress",
+                score: a.score ?? null,
+            }));
+            return res.json(minimal);
+        }
         return res.json({
             exam: {
                 id: exam.id,
