@@ -4,7 +4,7 @@ import { Router } from "express";
 import { prisma } from "../prisma";
 import crypto from "crypto";
 import PDFDocument from "pdfkit";
-import { Prisma } from "@prisma/client";
+import { ExamRole, Prisma } from "@prisma/client";
 import { authMiddleware } from "../authMiddleware"; // Necesario para asegurar user en request si se usa en rutas protegidas explícitas
 
 export const examsRouter = Router();
@@ -90,6 +90,23 @@ function logRawError(route: string, sql: string, err: any) {
     message: err?.message ?? String(err),
     sql,
   });
+}
+
+async function hasExamRole(
+  exam: { id: string; ownerId: string },
+  userId: string,
+  roles: ExamRole[]
+): Promise<boolean> {
+  const member = await prisma.examMember.findFirst({
+    where: { examId: exam.id, userId },
+    select: { role: true },
+  });
+
+  if (member && roles.includes(member.role)) return true;
+
+  if (roles.includes(ExamRole.OWNER) && exam.ownerId === userId) return true;
+
+  return false;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -279,6 +296,27 @@ function formatDateTimeShort(value: any): string {
   } catch {
     return "—";
   }
+}
+
+function unwrapAnswerContent(content: any) {
+  if (content && typeof content === "object" && "value" in content) {
+    const wrapped = content as any;
+    return {
+      value: wrapped.value,
+      teacherFeedback:
+        typeof wrapped.teacherFeedback === "string"
+          ? wrapped.teacherFeedback
+          : null,
+    };
+  }
+  return { value: content, teacherFeedback: null };
+}
+
+function wrapAnswerContent(existingContent: any, teacherFeedback?: string | null) {
+  const { value } = unwrapAnswerContent(existingContent);
+  if (teacherFeedback === undefined) return { value, teacherFeedback: null };
+  if (teacherFeedback === null) return { value, teacherFeedback: null };
+  return { value, teacherFeedback };
 }
 
 /** Asegura la tabla QuestionLite (se comparte el formato con el builder) */
@@ -615,7 +653,11 @@ examsRouter.get("/exams/:code/attempts", authMiddleware, async (req, res) => {
     const exam = await findExamByCode(req.params.code);
     if (!exam) return res.status(404).json({ error: "EXAM_NOT_FOUND" });
 
-    if (exam.ownerId && exam.ownerId !== userId) {
+    const allowed = await hasExamRole(exam, userId, [
+      ExamRole.OWNER,
+      ExamRole.GRADER,
+    ]);
+    if (!allowed) {
       return res.status(403).json({ error: "FORBIDDEN" });
     }
 
@@ -742,6 +784,123 @@ examsRouter.get("/exams/:code/attempts", authMiddleware, async (req, res) => {
     });
   } catch (e: any) {
     return res.status(500).json({ error: e?.message || String(e) });
+  }
+});
+
+/**
+ * POST /api/exams/:code/invites
+ * Body: { email, role? }
+ */
+examsRouter.post("/exams/:code/invites", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ error: "UNAUTHORIZED" });
+
+    const exam = await findExamByCode(req.params.code);
+    if (!exam) return res.status(404).json({ error: "EXAM_NOT_FOUND" });
+
+    const allowed = await hasExamRole(exam, userId, [ExamRole.OWNER]);
+    if (!allowed) return res.status(403).json({ error: "FORBIDDEN" });
+
+    const rawEmail = String(req.body?.email ?? "").trim().toLowerCase();
+    if (!rawEmail) return res.status(400).json({ error: "EMAIL_REQUIRED" });
+
+    const rawRole = String(req.body?.role ?? "GRADER").toUpperCase();
+    const role = rawRole === "OWNER" ? ExamRole.OWNER : ExamRole.GRADER;
+
+    const token = crypto.randomBytes(32).toString("hex");
+    const tokenHash = crypto
+      .createHash("sha256")
+      .update(token)
+      .digest("hex");
+
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+
+    await prisma.examInvite.create({
+      data: {
+        examId: exam.id,
+        email: rawEmail,
+        role,
+        tokenHash,
+        expiresAt,
+        invitedByUserId: userId,
+      },
+    });
+
+    const baseUrl =
+      process.env.FRONTEND_BASE_URL?.trim() || "http://localhost:3000";
+    const inviteLink = `${baseUrl}/invite?token=${token}`;
+
+    return res.json({ ok: true, inviteLink, expiresAt });
+  } catch (e: any) {
+    if (process.env.NODE_ENV !== "production") {
+      console.error("INVITE_CREATE_ERROR", e);
+    }
+    return res.status(500).json({ error: e?.message || "INVITE_CREATE_ERROR" });
+  }
+});
+
+/**
+ * POST /api/invites/accept
+ * Body: { token }
+ */
+examsRouter.post("/invites/accept", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user?.userId;
+    const userEmail = String(req.user?.email ?? "").trim().toLowerCase();
+    if (!userId) return res.status(401).json({ error: "UNAUTHORIZED" });
+
+    const token = String(req.body?.token ?? "").trim();
+    if (!token) return res.status(400).json({ error: "TOKEN_REQUIRED" });
+
+    const tokenHash = crypto
+      .createHash("sha256")
+      .update(token)
+      .digest("hex");
+
+    const invite = await prisma.examInvite.findFirst({
+      where: {
+        tokenHash,
+        acceptedAt: null,
+        expiresAt: { gt: new Date() },
+      },
+      include: {
+        exam: { select: { publicCode: true } },
+      },
+    });
+    if (!invite) return res.status(404).json({ error: "INVITE_NOT_FOUND" });
+
+    if (invite.email.trim().toLowerCase() !== userEmail) {
+      return res.status(403).json({ error: "EMAIL_MISMATCH" });
+    }
+
+    await prisma.examMember.upsert({
+      where: {
+        examId_userId: { examId: invite.examId, userId },
+      },
+      update: { role: invite.role },
+      create: {
+        examId: invite.examId,
+        userId,
+        role: invite.role,
+      },
+    });
+
+    await prisma.examInvite.update({
+      where: { id: invite.id },
+      data: { acceptedAt: new Date() },
+    });
+
+    return res.json({
+      ok: true,
+      examCode: invite.exam.publicCode,
+      role: invite.role,
+    });
+  } catch (e: any) {
+    if (process.env.NODE_ENV !== "production") {
+      console.error("INVITE_ACCEPT_ERROR", e);
+    }
+    return res.status(500).json({ error: e?.message || "INVITE_ACCEPT_ERROR" });
   }
 });
 /**
@@ -1784,7 +1943,7 @@ examsRouter.get("/attempts/:id/review", async (req, res) => {
       }
 
       const a = byQ.get(q.id);
-      const given = a?.content ?? null;
+      const given = unwrapAnswerContent(a?.content ?? null).value;
 
       return {
         id: q.id,
@@ -1821,6 +1980,232 @@ examsRouter.get("/attempts/:id/review", async (req, res) => {
     return res.status(500).json({ error: e?.message || String(e) });
   }
 });
+
+/**
+ * GET /api/exams/:code/attempts/:attemptId/grading
+ * Corrección manual: devuelve preguntas + respuestas + puntajes docentes.
+ */
+examsRouter.get(
+  "/exams/:code/attempts/:attemptId/grading",
+  authMiddleware,
+  async (req, res) => {
+    let sql = "";
+    try {
+      const userId = req.user?.userId;
+      if (!userId) return res.status(401).json({ error: "UNAUTHORIZED" });
+
+      const exam = await findExamByCode(req.params.code);
+      if (!exam) return res.status(404).json({ error: "EXAM_NOT_FOUND" });
+
+      const allowed = await hasExamRole(exam, userId, [
+        ExamRole.OWNER,
+        ExamRole.GRADER,
+      ]);
+      if (!allowed) {
+        return res.status(403).json({ error: "FORBIDDEN" });
+      }
+
+      const attempt = await prisma.attempt.findFirst({
+        where: { id: req.params.attemptId, examId: exam.id },
+      });
+      if (!attempt) return res.status(404).json({ error: "ATTEMPT_NOT_FOUND" });
+
+      await ensureQuestionLite();
+
+      sql = `
+        SELECT id, kind, stem, choices, answer, points
+        FROM "QuestionLite"
+        WHERE "examId" = $1
+        ORDER BY "createdAt" ASC
+      `;
+      const qs: any[] = await prisma.$queryRawUnsafe(sql, exam.id);
+
+      const answers = await prisma.answer.findMany({
+        where: { attemptId: attempt.id },
+        select: { questionId: true, content: true, score: true },
+      });
+      const byQ = new Map(answers.map((a) => [a.questionId, a]));
+
+      let maxPoints = 0;
+      let currentScore = 0;
+
+      const questions = qs.map((q) => {
+        let options: any = null;
+        try {
+          options = q.choices ? JSON.parse(String(q.choices)) : null;
+        } catch {
+          options = null;
+        }
+
+        let correctAnswer: any = null;
+        try {
+          correctAnswer = q.answer ? JSON.parse(String(q.answer)) : null;
+        } catch {
+          correctAnswer = null;
+        }
+
+        const max = Number(q.points ?? 1) || 1;
+        maxPoints += max;
+
+        const a = byQ.get(q.id);
+        const unwrapped = unwrapAnswerContent(a?.content ?? null);
+        const score = typeof a?.score === "number" ? a.score : null;
+        if (typeof score === "number") currentScore += score;
+
+        return {
+          questionId: q.id,
+          type: normalizeQuestionKind(q.kind),
+          prompt: q.stem,
+          options,
+          correctAnswer,
+          maxPoints: max,
+          studentAnswer: unwrapped.value ?? null,
+          teacherScore: score,
+          teacherFeedback: unwrapped.teacherFeedback,
+        };
+      });
+
+      return res.json({
+        attempt: {
+          id: attempt.id,
+          studentName: attempt.studentName ?? null,
+          status: attempt.status ?? null,
+          submittedAt: attempt.endAt ?? null,
+          score: attempt.score ?? null,
+        },
+        questions,
+        totals: {
+          maxPoints,
+          currentScore,
+        },
+      });
+    } catch (e: any) {
+      logRawError("/api/exams/:code/attempts/:attemptId/grading", sql, e);
+      if (process.env.NODE_ENV !== "production") {
+        console.error("GRADING_GET_ERROR", e);
+      }
+      return res.status(500).json({ error: e?.message || String(e) });
+    }
+  }
+);
+
+/**
+ * PATCH /api/exams/:code/attempts/:attemptId/grading
+ * Body: { perQuestion: [{ questionId, score, feedback? }], finalize?: boolean }
+ */
+examsRouter.patch(
+  "/exams/:code/attempts/:attemptId/grading",
+  authMiddleware,
+  async (req, res) => {
+    try {
+      const userId = req.user?.userId;
+      if (!userId) return res.status(401).json({ error: "UNAUTHORIZED" });
+
+      const exam = await findExamByCode(req.params.code);
+      if (!exam) return res.status(404).json({ error: "EXAM_NOT_FOUND" });
+
+      const allowed = await hasExamRole(exam, userId, [
+        ExamRole.OWNER,
+        ExamRole.GRADER,
+      ]);
+      if (!allowed) {
+        return res.status(403).json({ error: "FORBIDDEN" });
+      }
+
+      const attempt = await prisma.attempt.findFirst({
+        where: { id: req.params.attemptId, examId: exam.id },
+      });
+      if (!attempt) return res.status(404).json({ error: "ATTEMPT_NOT_FOUND" });
+
+      const body = req.body ?? {};
+      const perQuestion = Array.isArray(body.perQuestion)
+        ? body.perQuestion
+        : null;
+      if (!perQuestion) {
+        return res.status(400).json({ error: "PER_QUESTION_REQUIRED" });
+      }
+
+      for (const item of perQuestion) {
+        const questionId = String(item?.questionId || "").trim();
+        if (!questionId) continue;
+
+        const scoreRaw = item?.score;
+        const score =
+          scoreRaw === null || scoreRaw === undefined
+            ? null
+            : Math.max(0, Number(scoreRaw));
+        if (score !== null && Number.isNaN(score)) {
+          return res.status(400).json({ error: "SCORE_INVALID" });
+        }
+
+        const feedback =
+          item?.feedback !== undefined ? String(item.feedback) : undefined;
+
+        const existing = await prisma.answer.findFirst({
+          where: { attemptId: attempt.id, questionId },
+        });
+
+        if (existing) {
+          const data: any = {};
+          if (score !== null) data.score = score;
+          if (feedback !== undefined) {
+            data.content = wrapAnswerContent(existing.content, feedback);
+          }
+          if (Object.keys(data).length > 0) {
+            await prisma.answer.update({
+              where: { id: existing.id },
+              data,
+            });
+          }
+        } else {
+          await prisma.answer.create({
+            data: {
+              attemptId: attempt.id,
+              questionId,
+              score: score ?? null,
+              content:
+                feedback !== undefined
+                  ? wrapAnswerContent(null, feedback)
+                  : Prisma.DbNull,
+            },
+          });
+        }
+      }
+
+      const allAnswers = await prisma.answer.findMany({
+        where: { attemptId: attempt.id },
+        select: { score: true },
+      });
+      const totalScore = allAnswers.reduce((sum, a) => {
+        return sum + (typeof a.score === "number" ? a.score : 0);
+      }, 0);
+
+      const finalize = body.finalize === true;
+      const dataToUpdate: any = {
+        score: totalScore,
+      };
+      if (finalize) dataToUpdate.status = "graded";
+
+      const updatedAttempt = await prisma.attempt.update({
+        where: { id: attempt.id },
+        data: dataToUpdate,
+        select: { id: true, status: true, score: true },
+      });
+
+      return res.json({
+        ok: true,
+        attemptId: updatedAttempt.id,
+        status: updatedAttempt.status,
+        totalScore: updatedAttempt.score ?? null,
+      });
+    } catch (e: any) {
+      if (process.env.NODE_ENV !== "production") {
+        console.error("GRADING_PATCH_ERROR", e);
+      }
+      return res.status(500).json({ error: e?.message || String(e) });
+    }
+  }
+);
 // DELETE /api/exams/:id
 // Elimina un examen y todas sus dependencias (attempts, answers, events, messages, questions)
 examsRouter.delete("/exams/:id", async (req, res) => {

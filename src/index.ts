@@ -4,6 +4,7 @@ import express from "express";
 import cors from "cors";
 import "dotenv/config";
 import crypto from "crypto";
+import "dotenv/config";
 
 // Importamos nuevas rutas
 import { authRouter } from "./routes/auth";
@@ -13,7 +14,7 @@ import { authMiddleware, optionalAuthMiddleware } from "./authMiddleware";
 import { examsRouter } from "./routes/exams";
 import { questionsRouter } from "./routes/questions";
 import { prisma } from "./prisma";
-import { ExamStatus } from "@prisma/client";
+import { ExamRole, ExamStatus } from "@prisma/client";
 
 const app = express();
 const allowedOrigins = new Set<string>(["http://localhost:3000"]);
@@ -209,6 +210,20 @@ app.post("/api/exams", optionalAuthMiddleware, async (req, res) => {
         teacherName,
       },
     });
+
+    if (req.user?.userId) {
+      try {
+        await prisma.examMember.create({
+          data: {
+            examId: exam.id,
+            userId: req.user.userId,
+            role: ExamRole.OWNER,
+          },
+        });
+      } catch (e) {
+        console.error("CREATE_EXAM_MEMBER_ERROR", e);
+      }
+    }
 
     const durationRaw2 = exam.durationMin ?? exam.durationMins ?? null;
     const durationMinutes =

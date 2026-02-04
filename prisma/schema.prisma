@@ -21,6 +21,8 @@ model User {
 
   teacherProfile  TeacherProfile?
   teacherCalendar TeacherCalendar?
+  examMembers     ExamMember[]
+  examInvitesSent ExamInvite[] @relation("ExamInviteSent")
 }
 
 model TeacherProfile {
@@ -65,6 +67,8 @@ model Exam {
 
   questions Question[]
   attempts  Attempt[]
+  members   ExamMember[]
+  invites   ExamInvite[]
 }
 
 model Question {
@@ -114,6 +118,42 @@ model Answer {
   attempt Attempt @relation(fields: [attemptId], references: [id])
 
   @@unique([attemptId, questionId])
+}
+
+enum ExamRole {
+  OWNER
+  GRADER
+}
+
+model ExamMember {
+  id        String   @id @default(cuid())
+  examId    String
+  userId    String
+  role      ExamRole
+  createdAt DateTime @default(now())
+
+  exam Exam @relation(fields: [examId], references: [id])
+  user User @relation(fields: [userId], references: [id])
+
+  @@unique([examId, userId])
+}
+
+model ExamInvite {
+  id               String    @id @default(cuid())
+  examId           String
+  email            String
+  role             ExamRole  @default(GRADER)
+  tokenHash        String
+  expiresAt        DateTime
+  acceptedAt       DateTime?
+  invitedByUserId  String
+  createdAt        DateTime  @default(now())
+
+  exam       Exam @relation(fields: [examId], references: [id])
+  invitedBy  User @relation("ExamInviteSent", fields: [invitedByUserId], references: [id])
+
+  @@index([examId])
+  @@index([email])
 }
 
 model Event {
