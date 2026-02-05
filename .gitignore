@@ -6,3 +6,4 @@ node_modules
 # Local Prisma DB (no commitear)
 prisma/dev.db
 prisma/*.db
+dist
