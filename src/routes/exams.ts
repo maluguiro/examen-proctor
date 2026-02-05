@@ -653,10 +653,15 @@ examsRouter.get("/exams/:code/attempts", authMiddleware, async (req, res) => {
     const exam = await findExamByCode(req.params.code);
     if (!exam) return res.status(404).json({ error: "EXAM_NOT_FOUND" });
 
-    const allowed = await hasExamRole(exam, userId, [
-      ExamRole.OWNER,
-      ExamRole.GRADER,
-    ]);
+    const isBandeja =
+      String(req.query.view || "").toLowerCase() === "bandeja";
+    const allowed = await hasExamRole(
+      exam,
+      userId,
+      isBandeja
+        ? [ExamRole.OWNER, ExamRole.GRADER, ExamRole.PROCTOR]
+        : [ExamRole.OWNER, ExamRole.PROCTOR]
+    );
     if (!allowed) {
       return res.status(403).json({ error: "FORBIDDEN" });
     }
@@ -806,7 +811,11 @@ examsRouter.post("/exams/:code/invites", authMiddleware, async (req, res) => {
     if (!rawEmail) return res.status(400).json({ error: "EMAIL_REQUIRED" });
 
     const rawRole = String(req.body?.role ?? "GRADER").toUpperCase();
-    const role = rawRole === "OWNER" ? ExamRole.OWNER : ExamRole.GRADER;
+    if (rawRole !== "GRADER" && rawRole !== "PROCTOR") {
+      return res.status(400).json({ error: "INVALID_ROLE" });
+    }
+    const role =
+      rawRole === "PROCTOR" ? ExamRole.PROCTOR : ExamRole.GRADER;
 
     const token = crypto.randomBytes(32).toString("hex");
     const tokenHash = crypto
@@ -2000,6 +2009,7 @@ examsRouter.get(
       const allowed = await hasExamRole(exam, userId, [
         ExamRole.OWNER,
         ExamRole.GRADER,
+        ExamRole.PROCTOR,
       ]);
       if (!allowed) {
         return res.status(403).json({ error: "FORBIDDEN" });
@@ -2107,6 +2117,7 @@ examsRouter.patch(
       const allowed = await hasExamRole(exam, userId, [
         ExamRole.OWNER,
         ExamRole.GRADER,
+        ExamRole.PROCTOR,
       ]);
       if (!allowed) {
         return res.status(403).json({ error: "FORBIDDEN" });

@@ -123,6 +123,7 @@ model Answer {
 enum ExamRole {
   OWNER
   GRADER
+  PROCTOR
 }
 
 model ExamMember {
