@@ -298,6 +298,172 @@ function formatDateTimeShort(value: any): string {
   }
 }
 
+function computeDeadline(startAt: Date, durationMins: number, extraTimeSecs: number) {
+  const totalMs = durationMins * 60 * 1000 + extraTimeSecs * 1000;
+  return new Date(startAt.getTime() + totalMs);
+}
+
+function isExpired(now: Date, deadline: Date) {
+  return now.getTime() >= deadline.getTime();
+}
+
+async function finalizeAttemptIfExpired(attempt: any, exam: any): Promise<any> {
+  if (attempt.endAt) return attempt;
+
+  const durationMin =
+    (exam as any).durationMins ?? (exam as any).durationMin ?? null;
+  if (!durationMin || durationMin <= 0 || !attempt.startAt) {
+    if (process.env.NODE_ENV !== "production") {
+      console.log("INVALID_DURATION", {
+        examId: exam?.id,
+        durationMins: (exam as any)?.durationMins ?? null,
+        durationMin: (exam as any)?.durationMin ?? null,
+        attemptId: attempt?.id,
+        status: attempt?.status,
+      });
+    }
+    return attempt;
+  }
+
+  const extraSecs = Number(attempt.extraTimeSecs ?? 0) || 0;
+  const deadline = computeDeadline(attempt.startAt, durationMin, extraSecs);
+  const now = new Date();
+
+  if (!isExpired(now, deadline)) return attempt;
+
+  const gm = String(exam.gradingMode || "auto").toLowerCase();
+  if (gm !== "manual") {
+    await ensureQuestionLite();
+
+    const qs: any[] = await prisma.$queryRawUnsafe(
+      `
+      SELECT id, kind, stem, choices, answer, points
+      FROM "QuestionLite"
+      WHERE "examId" = $1
+      ORDER BY "createdAt" ASC
+    `,
+      exam.id
+    );
+
+    const storedAnswers = await prisma.answer.findMany({
+      where: { attemptId: attempt.id },
+      select: { id: true, questionId: true, content: true },
+    });
+    const byQ = new Map(storedAnswers.map((a) => [a.questionId, a]));
+
+    let totalPoints = 0;
+    let score = 0;
+
+    for (const q of qs) {
+      const pts = Number(q.points ?? 1) || 1;
+      totalPoints += pts;
+
+      let correct: any = null;
+      try {
+        correct = q.answer ? JSON.parse(String(q.answer)) : null;
+      } catch {
+        correct = null;
+      }
+
+      const kind = normalizeQuestionKind(q.kind);
+      const stored = byQ.get(q.id);
+      const given = unwrapAnswerContent(stored?.content ?? null).value;
+
+      let partial: number | null = null;
+
+      if (kind === "TRUE_FALSE") {
+        const givenStr = String(given ?? "").toLowerCase();
+        const corr = String(correct ?? "").toLowerCase();
+        partial = givenStr === corr ? pts : 0;
+      } else if (kind === "MCQ") {
+        const givenNum = Number(given ?? -999);
+        const corrNum = Number(correct ?? -888);
+        partial = givenNum === corrNum ? pts : 0;
+      } else if (kind === "SHORT_TEXT") {
+        const corr = String(correct ?? "").trim().toLowerCase();
+        const givenStr = String(given ?? "").trim().toLowerCase();
+        partial = corr && givenStr && corr === givenStr ? pts : 0;
+      } else if (kind === "FILL_IN") {
+        let expected: string[] = [];
+        try {
+          if (Array.isArray((correct as any)?.answers)) {
+            expected = (correct as any).answers.map((x: any) =>
+              String(x ?? "")
+            );
+          }
+        } catch {
+          expected = [];
+        }
+
+        let givenArr: string[] = [];
+        if (Array.isArray(given)) {
+          givenArr = given.map((v: any) => String(v ?? ""));
+        } else if (given && Array.isArray((given as any).answers)) {
+          givenArr = (given as any).answers.map((v: any) => String(v ?? ""));
+        }
+
+        let ok = 0;
+        expected.forEach((exp, i) => {
+          if (
+            (givenArr[i] || "").toString().trim().toLowerCase() ===
+            String(exp).trim().toLowerCase()
+          ) {
+            ok++;
+          }
+        });
+        partial = expected.length ? (pts * ok) / expected.length : 0;
+      }
+
+      if (stored) {
+        await prisma.answer.update({
+          where: { id: stored.id },
+          data: { score: partial },
+        });
+      }
+
+      if (typeof partial === "number") {
+        score += partial;
+      }
+    }
+
+    const updated = await prisma.attempt.update({
+      where: { id: attempt.id },
+      data: {
+        status: "submitted",
+        endAt: now,
+        score,
+      },
+    });
+
+    if (process.env.NODE_ENV !== "production") {
+      console.log("EXPIRE_ATTEMPT auto-submitted", {
+        attemptId: attempt.id,
+        deadline,
+      });
+    }
+
+    return updated;
+  }
+
+  const updated = await prisma.attempt.update({
+    where: { id: attempt.id },
+    data: {
+      status: "submitted",
+      endAt: now,
+      score: null,
+    },
+  });
+
+  if (process.env.NODE_ENV !== "production") {
+    console.log("EXPIRE_ATTEMPT manual-submitted", {
+      attemptId: attempt.id,
+      deadline,
+    });
+  }
+
+  return updated;
+}
+
 function unwrapAnswerContent(content: any) {
   if (content && typeof content === "object" && "value" in content) {
     const wrapped = content as any;
@@ -526,16 +692,11 @@ examsRouter.put("/exams/:code", async (req, res) => {
       data.title = body.title.trim();
     }
 
-    // 🔹 duración: soportamos durationMinutes o durationMin
-    if (body.durationMinutes !== undefined && body.durationMinutes !== null) {
-      const v = Number(body.durationMinutes);
-      if (!Number.isNaN(v) && v >= 0) {
-        const mins = Math.floor(v);
-        data.durationMin = mins;
-        data.durationMins = mins;
-      }
-    } else if (body.durationMin !== undefined && body.durationMin !== null) {
-      const v = Number(body.durationMin);
+    // 🔹 duración: soportamos durationMinutes, durationMin, durationMins
+    const durationRaw =
+      body.durationMinutes ?? body.durationMin ?? body.durationMins ?? null;
+    if (durationRaw !== null && durationRaw !== undefined) {
+      const v = Number(durationRaw);
       if (!Number.isNaN(v) && v >= 0) {
         const mins = Math.floor(v);
         data.durationMin = mins;
@@ -549,6 +710,12 @@ examsRouter.put("/exams/:code", async (req, res) => {
       data.lives = v;
     }
 
+    // gradingMode: manual | auto
+    if (body.gradingMode !== undefined) {
+      const gm = String(body.gradingMode || "").toLowerCase();
+      data.gradingMode = gm === "manual" ? "manual" : "auto";
+    }
+
     // abrir/cerrar examen
     if (typeof body.isOpen === "boolean") {
       data.status = (body.isOpen ? "OPEN" : "DRAFT") as any;
@@ -558,6 +725,13 @@ examsRouter.put("/exams/:code", async (req, res) => {
       where: { id: exam.id },
       data,
     });
+
+    if (process.env.NODE_ENV !== "production" && data.gradingMode) {
+      console.log("EXAM_GRADINGMODE_UPDATED", {
+        examId: exam.id,
+        gradingMode: data.gradingMode,
+      });
+    }
 
     return res.json({ exam: toExamResponse(updated) });
   } catch (e: any) {
@@ -611,6 +785,18 @@ examsRouter.put("/exams/:code/meta", async (req, res) => {
     if (body.gradingMode) {
       const gm = String(body.gradingMode || "").toLowerCase();
       data.gradingMode = gm === "manual" ? "manual" : "auto";
+    }
+
+    // duración (meta): soporta durationMin/durationMins
+    const durationRaw =
+      body.durationMin ?? body.durationMins ?? null;
+    if (durationRaw !== null && durationRaw !== undefined) {
+      const v = Number(durationRaw);
+      if (!Number.isNaN(v) && v >= 0) {
+        const mins = Math.floor(v);
+        data.durationMin = mins;
+        data.durationMins = mins;
+      }
     }
 
     if (body.maxScore !== undefined && body.maxScore !== null) {
@@ -667,8 +853,14 @@ examsRouter.get("/exams/:code/attempts", authMiddleware, async (req, res) => {
     }
 
     const attempts = await prisma.attempt.findMany({
-      where: { examId: exam.id },
-      orderBy: { startAt: "asc" },
+      where: isBandeja
+        ? {
+            examId: exam.id,
+            endAt: { not: null },
+            status: { in: ["submitted", "in_review", "graded"] },
+          }
+        : { examId: exam.id },
+      orderBy: isBandeja ? { endAt: "desc" } : { startAt: "asc" },
       select: {
         id: true,
         studentName: true,
@@ -678,10 +870,38 @@ examsRouter.get("/exams/:code/attempts", authMiddleware, async (req, res) => {
         endAt: true,
         status: true,
         score: true, // 👈 NUEVO: necesario para mostrar puntaje
+        extraTimeSecs: true,
       },
     });
 
-    const ids = attempts.map((a) => a.id);
+    const normalizedAttempts = await Promise.all(
+      attempts.map(async (a) => {
+        if (a.endAt) return a;
+
+        let examForExpire: any = exam as any;
+        if (examForExpire?.durationMin === undefined && examForExpire?.durationMins === undefined) {
+          examForExpire = await prisma.exam.findUnique({
+            where: { id: exam.id },
+            select: { id: true, durationMin: true, durationMins: true, gradingMode: true },
+          });
+        }
+
+        if (process.env.NODE_ENV !== "production") {
+          console.log("EXPIRE_CHECK", {
+            examId: exam.id,
+            durationMins: (examForExpire as any)?.durationMins ?? null,
+            durationMin: (examForExpire as any)?.durationMin ?? null,
+            gradingMode: (examForExpire as any)?.gradingMode ?? null,
+            attemptId: a.id,
+            status: a.status,
+          });
+        }
+
+        return await finalizeAttemptIfExpired(a as any, examForExpire as any);
+      })
+    );
+
+    const ids = normalizedAttempts.map((a) => a.id);
     const events = await prisma.event.findMany({
       where: { attemptId: { in: ids } },
       select: { attemptId: true, type: true, reason: true, ts: true },
@@ -724,7 +944,7 @@ examsRouter.get("/exams/:code/attempts", authMiddleware, async (req, res) => {
       data.typesMap.set(rUpper, (data.typesMap.get(rUpper) ?? 0) + 1);
     }
 
-    const out = attempts.map((a) => {
+    const out = normalizedAttempts.map((a) => {
       const used = a.livesUsed ?? 0;
       const maxLives = exam.lives ?? 3;
       const remaining = Math.max(0, maxLives - used);
@@ -766,7 +986,7 @@ examsRouter.get("/exams/:code/attempts", authMiddleware, async (req, res) => {
     });
 
     if (String(req.query.view || "").toLowerCase() === "bandeja") {
-      const minimal = attempts.map((a) => ({
+      const minimal = normalizedAttempts.map((a) => ({
         id: a.id,
         studentName: a.studentName || "(sin nombre)",
         studentEmail: null,
@@ -787,6 +1007,127 @@ examsRouter.get("/exams/:code/attempts", authMiddleware, async (req, res) => {
       },
       attempts: out,
     });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || String(e) });
+  }
+});
+
+/**
+ * GET /api/grading/manual-exams
+ * Lista exámenes en modo corrección manual con conteos de intentos.
+ */
+examsRouter.get("/grading/manual-exams", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ error: "UNAUTHORIZED" });
+
+    const memberships = await prisma.examMember.findMany({
+      where: {
+        userId,
+        role: { in: [ExamRole.OWNER, ExamRole.GRADER, ExamRole.PROCTOR] },
+      },
+      select: {
+        examId: true,
+        exam: {
+          select: {
+            id: true,
+            ownerId: true,
+            publicCode: true,
+            title: true,
+            gradingMode: true,
+          },
+        },
+      },
+    });
+
+    const ownedExams = await prisma.exam.findMany({
+      where: { ownerId: userId },
+      select: {
+        id: true,
+        ownerId: true,
+        publicCode: true,
+        title: true,
+        gradingMode: true,
+      },
+    });
+
+    const byId = new Map<string, typeof ownedExams[number]>();
+    for (const m of memberships) byId.set(m.exam.id, m.exam);
+    for (const e of ownedExams) byId.set(e.id, e);
+
+    const manualExams = Array.from(byId.values()).filter(
+      (e) => String(e.gradingMode || "").toLowerCase() === "manual"
+    );
+
+    if (!manualExams.length) {
+      return res.json([]);
+    }
+
+    // Optional backfill: asegurar ExamMember OWNER para exámenes propios
+    const ownedManual = manualExams.filter((e) => e.ownerId === userId);
+    if (ownedManual.length) {
+      await Promise.all(
+        ownedManual.map((e) =>
+          prisma.examMember.upsert({
+            where: { examId_userId: { examId: e.id, userId } },
+            update: { role: ExamRole.OWNER },
+            create: { examId: e.id, userId, role: ExamRole.OWNER },
+          })
+        )
+      );
+    }
+
+    const examIds = manualExams.map((e) => e.id);
+
+    const submittedAgg = await prisma.attempt.groupBy({
+      by: ["examId"],
+      where: {
+        examId: { in: examIds },
+        endAt: { not: null },
+      },
+      _count: { _all: true },
+      _max: { endAt: true },
+    });
+
+    const pendingAgg = await prisma.attempt.groupBy({
+      by: ["examId"],
+      where: {
+        examId: { in: examIds },
+        endAt: { not: null },
+        OR: [
+          { status: { in: ["submitted", "in_review"] } },
+          { score: null },
+        ],
+      },
+      _count: { _all: true },
+    });
+
+    const submittedByExam = new Map(
+      submittedAgg.map((a) => [
+        a.examId,
+        {
+          submittedCount: a._count._all,
+          lastSubmissionAt: a._max.endAt,
+        },
+      ])
+    );
+
+    const pendingByExam = new Map(
+      pendingAgg.map((a) => [a.examId, a._count._all])
+    );
+
+    const items = manualExams.map((exam) => {
+      const submitted = submittedByExam.get(exam.id);
+      return {
+        code: exam.publicCode ?? exam.id.slice(0, 6),
+        title: exam.title,
+        pendingCount: pendingByExam.get(exam.id) ?? 0,
+        submittedCount: submitted?.submittedCount ?? 0,
+        lastSubmissionAt: submitted?.lastSubmissionAt ?? null,
+      };
+    });
+
+    return res.json(items);
   } catch (e: any) {
     return res.status(500).json({ error: e?.message || String(e) });
   }
@@ -1235,9 +1576,10 @@ examsRouter.post("/exams/:code/chat/broadcast", async (req, res) => {
 // POST /api/exams/:code/attempts/start
 examsRouter.post("/exams/:code/attempts/start", async (req, res) => {
   try {
-    const { studentName } = req.body ?? {};
+    const { studentName, studentEmail } = req.body ?? {};
+    const email = String(studentEmail || "").trim().toLowerCase();
     const name = String(studentName || "").trim();
-    if (!name) {
+    if (!email && !name) {
       return res.status(400).json({ error: "MISSING_NAME" });
     }
 
@@ -1246,13 +1588,58 @@ examsRouter.post("/exams/:code/attempts/start", async (req, res) => {
       return res.status(404).json({ error: "EXAM_NOT_FOUND" });
     }
 
-    const studentId = `s-${crypto.randomUUID()}`;
+    const studentKey = email ? `email:${email}` : `name:${name}`;
+
+    const inProgress = await prisma.attempt.findFirst({
+      where: {
+        examId: exam.id,
+        studentId: studentKey,
+        status: "in_progress",
+        endAt: null,
+      },
+    });
+
+    if (inProgress) {
+      const maybeFinal = await finalizeAttemptIfExpired(
+        inProgress as any,
+        exam as any
+      );
+      if (maybeFinal.endAt) {
+        return res
+          .status(409)
+          .json({ error: "ATTEMPT_ALREADY_SUBMITTED" });
+      }
+      return res.json({
+        attempt: {
+          id: inProgress.id,
+          studentName: inProgress.studentName,
+          startAt: inProgress.startAt,
+        },
+      });
+    }
+
+    const alreadySubmitted = await prisma.attempt.findFirst({
+      where: {
+        examId: exam.id,
+        studentId: studentKey,
+        OR: [
+          { endAt: { not: null } },
+          { status: { in: ["submitted", "in_review", "graded"] } },
+        ],
+      },
+    });
+
+    if (alreadySubmitted) {
+      return res.status(409).json({ error: "ATTEMPT_ALREADY_SUBMITTED" });
+    }
+
+    const studentId = studentKey;
 
     const attempt = await prisma.attempt.create({
       data: {
         examId: exam.id,
         studentId,
-        studentName: name,
+        studentName: name || email,
         status: "in_progress", // usá el mismo string que ya venías usando
         startAt: new Date(),
         endAt: null,
@@ -1284,7 +1671,7 @@ examsRouter.post("/exams/:code/attempts/start", async (req, res) => {
  */
 examsRouter.get("/attempts/:id/summary", async (req, res) => {
   try {
-    const attempt = await prisma.attempt.findUnique({
+    let attempt = await prisma.attempt.findUnique({
       where: { id: req.params.id },
     });
 
@@ -1300,6 +1687,30 @@ examsRouter.get("/attempts/:id/summary", async (req, res) => {
       return res.status(404).json({ error: "EXAM_NOT_FOUND" });
     }
 
+    let examForExpire: any = exam as any;
+    if (examForExpire?.durationMin === undefined && examForExpire?.durationMins === undefined) {
+      examForExpire = await prisma.exam.findUnique({
+        where: { id: exam.id },
+        select: { id: true, durationMin: true, durationMins: true, gradingMode: true },
+      });
+    }
+
+    if (process.env.NODE_ENV !== "production") {
+      console.log("EXPIRE_CHECK", {
+        examId: exam.id,
+        durationMins: (examForExpire as any)?.durationMins ?? null,
+        durationMin: (examForExpire as any)?.durationMin ?? null,
+        gradingMode: (examForExpire as any)?.gradingMode ?? null,
+        attemptId: attempt.id,
+        status: attempt.status,
+      });
+    }
+
+    attempt = await finalizeAttemptIfExpired(attempt as any, examForExpire as any);
+    if (!attempt) {
+      return res.status(404).json({ error: "ATTEMPT_NOT_FOUND" });
+    }
+
     // VIDAS: Exam.lives - Attempt.livesUsed
     const maxLives = (exam as any).lives != null ? (exam as any).lives : 3;
     const used =
@@ -1309,7 +1720,7 @@ examsRouter.get("/attempts/:id/summary", async (req, res) => {
 
     // TIEMPO
     const durationMin =
-      (exam as any).durationMin ?? (exam as any).durationMins ?? null;
+      (exam as any).durationMins ?? (exam as any).durationMin ?? null;
 
     let secondsLeft: number | null = null;
 
@@ -1324,21 +1735,106 @@ examsRouter.get("/attempts/:id/summary", async (req, res) => {
       secondsLeft = Math.max(0, totalSecs - elapsedSecs);
     }
 
-    // Si se quedó sin tiempo y aún no está marcado como terminado, lo cerramos
-    if (secondsLeft === 0 && attempt.status !== "finished") {
-      await prisma.attempt.update({
-        where: { id: attempt.id },
-        data: {
-          status: "finished",
-          endAt: new Date(),
-        },
-      });
-    }
-
     return res.json({ remaining, secondsLeft });
   } catch (e: any) {
     console.error(e);
     return res.status(500).json({ error: e?.message || "SUMMARY_ERROR" });
+  }
+});
+
+/**
+ * PATCH /api/attempts/:attemptId/draft
+ * Body: { answers: [{ questionId, value }] }
+ */
+examsRouter.patch("/attempts/:attemptId/draft", async (req, res) => {
+  try {
+    const attemptId = String(req.params.attemptId || "").trim();
+    if (!attemptId) {
+      return res.status(400).json({ error: "ATTEMPT_ID_REQUIRED" });
+    }
+
+    const attempt = await prisma.attempt.findUnique({
+      where: { id: attemptId },
+      select: { id: true, status: true, endAt: true },
+    });
+    if (!attempt) return res.status(404).json({ error: "ATTEMPT_NOT_FOUND" });
+
+    if (attempt.endAt || attempt.status !== "in_progress") {
+      return res.status(409).json({ error: "ATTEMPT_CLOSED" });
+    }
+
+    const answers = Array.isArray(req.body?.answers) ? req.body.answers : null;
+    if (!answers) {
+      return res.status(400).json({ error: "ANSWERS_REQUIRED" });
+    }
+    if (answers.length > 200) {
+      return res.status(400).json({ error: "ANSWERS_TOO_LARGE" });
+    }
+
+    for (const item of answers) {
+      const questionId = String(item?.questionId || "").trim();
+      if (!questionId) continue;
+
+      const value = item?.value ?? null;
+      const size = JSON.stringify(value ?? null).length;
+      if (size > 20000) {
+        return res.status(400).json({ error: "ANSWER_VALUE_TOO_LARGE" });
+      }
+
+      await prisma.answer.upsert({
+        where: { attemptId_questionId: { attemptId, questionId } },
+        update: {
+          content: value === null ? Prisma.DbNull : value,
+        },
+        create: {
+          attemptId,
+          questionId,
+          content: value === null ? Prisma.DbNull : value,
+        },
+      });
+    }
+
+    return res.json({ ok: true });
+  } catch (e: any) {
+    if (process.env.NODE_ENV !== "production") {
+      console.error("DRAFT_SAVE_ERROR", e);
+    }
+    return res.status(500).json({ error: e?.message || "DRAFT_SAVE_ERROR" });
+  }
+});
+
+/**
+ * GET /api/attempts/:attemptId/draft
+ */
+examsRouter.get("/attempts/:attemptId/draft", async (req, res) => {
+  try {
+    const attemptId = String(req.params.attemptId || "").trim();
+    if (!attemptId) {
+      return res.status(400).json({ error: "ATTEMPT_ID_REQUIRED" });
+    }
+
+    const attempt = await prisma.attempt.findUnique({
+      where: { id: attemptId },
+      select: { id: true },
+    });
+    if (!attempt) return res.status(404).json({ error: "ATTEMPT_NOT_FOUND" });
+
+    const rows = await prisma.answer.findMany({
+      where: { attemptId },
+      select: { questionId: true, content: true },
+    });
+
+    const answers = rows.map((r) => ({
+      questionId: r.questionId,
+      value: unwrapAnswerContent(r.content).value ?? null,
+    }));
+
+    return res.json({ attemptId, answers });
+  } catch (e: any) {
+    if (process.env.NODE_ENV !== "production") {
+      console.error("DRAFT_LOAD_ERROR", e);
+    }
+    return res.status(500).json({ error: e?.message || "DRAFT_LOAD_ERROR" });
   }
 });
 

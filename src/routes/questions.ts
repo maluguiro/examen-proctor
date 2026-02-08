@@ -187,7 +187,7 @@ questionsRouter.post("/exams/:code/questions", async (req, res) => {
     const id = crypto.randomUUID();
 
     await prisma.$executeRawUnsafe(
-      `INSERT INTO "QuestionLite" (id, examId, kind, stem, choices, answer, points)
+      `INSERT INTO "QuestionLite" (id, "examId", kind, stem, choices, answer, points)
        VALUES ($1, $2, $3, $4, $5, $6, $7)`,
       id,
       exam.id,
