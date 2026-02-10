@@ -1,4 +1,4 @@
-// api/src/routes/exams.ts
+﻿// api/src/routes/exams.ts
 
 import { Router } from "express";
 import { prisma } from "../prisma";
@@ -526,62 +526,6 @@ async function ensureExamChatTable() {
   await repairExamChatLiteSchema();
   await logLiteSchemaOnce();
 }
-/**
- * GET /api/exams
- * Lista exámenes, opcionalmente filtrando por teacherName y/o subject.
- * Ejemplo:
- *   GET /api/exams?teacherName=Gomez
- */
-examsRouter.get("/exams", async (req, res) => {
-  try {
-    const teacherNameRaw = String(req.query.teacherName ?? "").trim();
-    const subjectRaw = String(req.query.subject ?? "").trim();
-
-    const where: any = {};
-
-    if (teacherNameRaw) {
-      where.teacherName = {
-        contains: teacherNameRaw,
-        mode: "insensitive",
-      };
-    }
-
-    if (subjectRaw) {
-      where.subject = {
-        contains: subjectRaw,
-        mode: "insensitive",
-      };
-    }
-
-    const exams = await prisma.exam.findMany({
-      where,
-      orderBy: {
-        createdAt: "desc", // si por alguna razón no existe, podés cambiarlo a id
-      },
-    });
-
-    const items = exams.map((e: any) => ({
-      id: e.id,
-      code: e.publicCode ?? e.id.slice(0, 6),
-      title: e.title ?? "(sin título)",
-      subject: e.subject ?? null,
-      teacherName: e.teacherName ?? null,
-      status: e.status ?? "DRAFT",
-      openAt: e.openAt ? e.openAt.toISOString() : null,
-      createdAt: e.createdAt ? e.createdAt.toISOString() : null,
-    }));
-
-    return res.json({ exams: items });
-  } catch (e: any) {
-    console.error("LIST_EXAMS_ERROR", e);
-    return res.status(500).json({ error: e?.message || "LIST_EXAMS_ERROR" });
-  }
-});
-
-/* -------------------------------------------------------------------------- */
-/*                               RUTAS DOCENTE                                */
-/* -------------------------------------------------------------------------- */
-
 /**
  * GET /api/exams/by-code/:code
  * Endpoint público para que el alumno busque examen por su código.

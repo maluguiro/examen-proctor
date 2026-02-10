@@ -334,5 +334,65 @@ teacherRouter.get("/exams", async (req, res) => {
     }
 });
 
+/**
+ * POST /api/teacher/exams/claim-legacy
+ * Reclama exámenes legacy (ownerId = "docente-local") sin membresías.
+ * Dev-only + ENABLE_LEGACY_CLAIM=true
+ */
+teacherRouter.post("/exams/claim-legacy", async (req, res) => {
+    try {
+        const userId = req.user?.userId;
+        if (!userId) return res.status(401).json({ error: "UNAUTHORIZED" });
+
+        if (process.env.NODE_ENV === "production" || process.env.ENABLE_LEGACY_CLAIM !== "true") {
+            return res.status(404).json({ error: "NOT_FOUND" });
+        }
+
+        const legacy = await prisma.exam.findMany({
+            where: {
+                ownerId: "docente-local",
+                members: { none: {} },
+            },
+            select: { id: true },
+        });
+
+        const examIds = legacy.map((e) => e.id);
+        if (examIds.length === 0) {
+            return res.json({ claimed: 0, examIds: [] });
+        }
+
+        const claimed = await prisma.$transaction(async (tx) => {
+            const update = await tx.exam.updateMany({
+                where: { id: { in: examIds }, ownerId: "docente-local" },
+                data: { ownerId: userId },
+            });
+
+            await tx.examMember.createMany({
+                data: examIds.map((id) => ({
+                    examId: id,
+                    userId,
+                    role: "OWNER",
+                })),
+                skipDuplicates: true,
+            });
+
+            return update.count;
+        });
+
+        if (process.env.NODE_ENV !== "production") {
+            console.log("LEGACY_CLAIM", {
+                userId,
+                claimed,
+                examIdsCount: examIds.length,
+            });
+        }
+
+        return res.json({ claimed, examIds });
+    } catch (err: any) {
+        console.error("CLAIM_LEGACY_EXAMS_ERROR", err);
+        return res.status(500).json({ error: err?.message || "INTERNAL_ERROR" });
+    }
+});
+
 
 
