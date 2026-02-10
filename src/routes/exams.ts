@@ -1,13 +1,113 @@
-// api/src/routes/exams.ts
+﻿// api/src/routes/exams.ts
 
 import { Router } from "express";
 import { prisma } from "../prisma";
 import crypto from "crypto";
 import PDFDocument from "pdfkit";
-import { Prisma } from "@prisma/client";
+import { ExamRole, Prisma } from "@prisma/client";
 import { authMiddleware } from "../authMiddleware"; // Necesario para asegurar user en request si se usa en rutas protegidas explícitas
 
 export const examsRouter = Router();
+
+type LiteColumns = Set<string>;
+const globalAny = globalThis as any;
+
+async function getLiteColumns(tableName: string): Promise<LiteColumns> {
+  const rows = await prisma.$queryRawUnsafe<{ column_name: string }[]>(
+    `
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND lower(table_name) = lower($1)
+    ORDER BY ordinal_position
+  `,
+    tableName
+  );
+  return new Set((rows ?? []).map((r) => String(r.column_name)));
+}
+
+async function logLiteSchemaOnce() {
+  if (globalAny.__liteSchemaLogged) return;
+  globalAny.__liteSchemaLogged = true;
+
+  try {
+    const questionCols = await getLiteColumns("QuestionLite");
+    const chatCols = await getLiteColumns("ExamChatLite");
+    console.log("LITE_SCHEMA", {
+      QuestionLite: Array.from(questionCols),
+      ExamChatLite: Array.from(chatCols),
+    });
+  } catch (e) {
+    console.error("LITE_SCHEMA_LOG_ERROR", e);
+  }
+}
+
+async function repairQuestionLiteSchema() {
+  const cols = await getLiteColumns("QuestionLite");
+
+  if (cols.has("examid") && !cols.has("examId")) {
+    await prisma.$executeRawUnsafe(
+      `ALTER TABLE "QuestionLite" RENAME COLUMN examid TO "examId";`
+    );
+  }
+  if (cols.has("createdat") && !cols.has("createdAt")) {
+    await prisma.$executeRawUnsafe(
+      `ALTER TABLE "QuestionLite" RENAME COLUMN createdat TO "createdAt";`
+    );
+  }
+}
+
+async function repairExamChatLiteSchema() {
+  const cols = await getLiteColumns("ExamChatLite");
+
+  if (cols.has("examid") && !cols.has("examId")) {
+    await prisma.$executeRawUnsafe(
+      `ALTER TABLE "ExamChatLite" RENAME COLUMN examid TO "examId";`
+    );
+  }
+  if (cols.has("fromrole") && !cols.has("fromRole")) {
+    await prisma.$executeRawUnsafe(
+      `ALTER TABLE "ExamChatLite" RENAME COLUMN fromrole TO "fromRole";`
+    );
+  }
+  if (cols.has("authorname") && !cols.has("authorName")) {
+    await prisma.$executeRawUnsafe(
+      `ALTER TABLE "ExamChatLite" RENAME COLUMN authorname TO "authorName";`
+    );
+  }
+  if (cols.has("createdat") && !cols.has("createdAt")) {
+    await prisma.$executeRawUnsafe(
+      `ALTER TABLE "ExamChatLite" RENAME COLUMN createdat TO "createdAt";`
+    );
+  }
+}
+
+function logRawError(route: string, sql: string, err: any) {
+  if (process.env.NODE_ENV === "production") return;
+  console.error("RAW_SQL_ERROR", {
+    route,
+    code: err?.code ?? null,
+    message: err?.message ?? String(err),
+    sql,
+  });
+}
+
+async function hasExamRole(
+  exam: { id: string; ownerId: string },
+  userId: string,
+  roles: ExamRole[]
+): Promise<boolean> {
+  const member = await prisma.examMember.findFirst({
+    where: { examId: exam.id, userId },
+    select: { role: true },
+  });
+
+  if (member && roles.includes(member.role)) return true;
+
+  if (roles.includes(ExamRole.OWNER) && exam.ownerId === userId) return true;
+
+  return false;
+}
 
 /* -------------------------------------------------------------------------- */
 /*                        MODIFICACIÓN DE INTENTOS (DOCENTE)                  */
@@ -198,21 +298,211 @@ function formatDateTimeShort(value: any): string {
   }
 }
 
+function computeDeadline(startAt: Date, durationMins: number, extraTimeSecs: number) {
+  const totalMs = durationMins * 60 * 1000 + extraTimeSecs * 1000;
+  return new Date(startAt.getTime() + totalMs);
+}
+
+function isExpired(now: Date, deadline: Date) {
+  return now.getTime() >= deadline.getTime();
+}
+
+async function finalizeAttemptIfExpired(attempt: any, exam: any): Promise<any> {
+  if (attempt.endAt) return attempt;
+
+  const durationMin =
+    (exam as any).durationMins ?? (exam as any).durationMin ?? null;
+  if (!durationMin || durationMin <= 0 || !attempt.startAt) {
+    if (process.env.NODE_ENV !== "production") {
+      console.log("INVALID_DURATION", {
+        examId: exam?.id,
+        durationMins: (exam as any)?.durationMins ?? null,
+        durationMin: (exam as any)?.durationMin ?? null,
+        attemptId: attempt?.id,
+        status: attempt?.status,
+      });
+    }
+    return attempt;
+  }
+
+  const extraSecs = Number(attempt.extraTimeSecs ?? 0) || 0;
+  const deadline = computeDeadline(attempt.startAt, durationMin, extraSecs);
+  const now = new Date();
+
+  if (!isExpired(now, deadline)) return attempt;
+
+  const gm = String(exam.gradingMode || "auto").toLowerCase();
+  if (gm !== "manual") {
+    await ensureQuestionLite();
+
+    const qs: any[] = await prisma.$queryRawUnsafe(
+      `
+      SELECT id, kind, stem, choices, answer, points
+      FROM "QuestionLite"
+      WHERE "examId" = $1
+      ORDER BY "createdAt" ASC
+    `,
+      exam.id
+    );
+
+    const storedAnswers = await prisma.answer.findMany({
+      where: { attemptId: attempt.id },
+      select: { id: true, questionId: true, content: true },
+    });
+    const byQ = new Map(storedAnswers.map((a) => [a.questionId, a]));
+
+    let totalPoints = 0;
+    let score = 0;
+
+    for (const q of qs) {
+      const pts = Number(q.points ?? 1) || 1;
+      totalPoints += pts;
+
+      let correct: any = null;
+      try {
+        correct = q.answer ? JSON.parse(String(q.answer)) : null;
+      } catch {
+        correct = null;
+      }
+
+      const kind = normalizeQuestionKind(q.kind);
+      const stored = byQ.get(q.id);
+      const given = unwrapAnswerContent(stored?.content ?? null).value;
+
+      let partial: number | null = null;
+
+      if (kind === "TRUE_FALSE") {
+        const givenStr = String(given ?? "").toLowerCase();
+        const corr = String(correct ?? "").toLowerCase();
+        partial = givenStr === corr ? pts : 0;
+      } else if (kind === "MCQ") {
+        const givenNum = Number(given ?? -999);
+        const corrNum = Number(correct ?? -888);
+        partial = givenNum === corrNum ? pts : 0;
+      } else if (kind === "SHORT_TEXT") {
+        const corr = String(correct ?? "").trim().toLowerCase();
+        const givenStr = String(given ?? "").trim().toLowerCase();
+        partial = corr && givenStr && corr === givenStr ? pts : 0;
+      } else if (kind === "FILL_IN") {
+        let expected: string[] = [];
+        try {
+          if (Array.isArray((correct as any)?.answers)) {
+            expected = (correct as any).answers.map((x: any) =>
+              String(x ?? "")
+            );
+          }
+        } catch {
+          expected = [];
+        }
+
+        let givenArr: string[] = [];
+        if (Array.isArray(given)) {
+          givenArr = given.map((v: any) => String(v ?? ""));
+        } else if (given && Array.isArray((given as any).answers)) {
+          givenArr = (given as any).answers.map((v: any) => String(v ?? ""));
+        }
+
+        let ok = 0;
+        expected.forEach((exp, i) => {
+          if (
+            (givenArr[i] || "").toString().trim().toLowerCase() ===
+            String(exp).trim().toLowerCase()
+          ) {
+            ok++;
+          }
+        });
+        partial = expected.length ? (pts * ok) / expected.length : 0;
+      }
+
+      if (stored) {
+        await prisma.answer.update({
+          where: { id: stored.id },
+          data: { score: partial },
+        });
+      }
+
+      if (typeof partial === "number") {
+        score += partial;
+      }
+    }
+
+    const updated = await prisma.attempt.update({
+      where: { id: attempt.id },
+      data: {
+        status: "submitted",
+        endAt: now,
+        score,
+      },
+    });
+
+    if (process.env.NODE_ENV !== "production") {
+      console.log("EXPIRE_ATTEMPT auto-submitted", {
+        attemptId: attempt.id,
+        deadline,
+      });
+    }
+
+    return updated;
+  }
+
+  const updated = await prisma.attempt.update({
+    where: { id: attempt.id },
+    data: {
+      status: "submitted",
+      endAt: now,
+      score: null,
+    },
+  });
+
+  if (process.env.NODE_ENV !== "production") {
+    console.log("EXPIRE_ATTEMPT manual-submitted", {
+      attemptId: attempt.id,
+      deadline,
+    });
+  }
+
+  return updated;
+}
+
+function unwrapAnswerContent(content: any) {
+  if (content && typeof content === "object" && "value" in content) {
+    const wrapped = content as any;
+    return {
+      value: wrapped.value,
+      teacherFeedback:
+        typeof wrapped.teacherFeedback === "string"
+          ? wrapped.teacherFeedback
+          : null,
+    };
+  }
+  return { value: content, teacherFeedback: null };
+}
+
+function wrapAnswerContent(existingContent: any, teacherFeedback?: string | null) {
+  const { value } = unwrapAnswerContent(existingContent);
+  if (teacherFeedback === undefined) return { value, teacherFeedback: null };
+  if (teacherFeedback === null) return { value, teacherFeedback: null };
+  return { value, teacherFeedback };
+}
+
 /** Asegura la tabla QuestionLite (se comparte el formato con el builder) */
 async function ensureQuestionLite() {
   await prisma.$executeRawUnsafe(`
     CREATE TABLE IF NOT EXISTS "QuestionLite" (
       id        TEXT PRIMARY KEY,
-      examId    TEXT NOT NULL,
+      "examId"  TEXT NOT NULL,
       kind      TEXT NOT NULL, -- 'MCQ' | 'TRUE_FALSE' | 'SHORT_TEXT' | 'FILL_IN'
       stem      TEXT NOT NULL, -- enunciado
       choices   TEXT,          -- JSON string (solo MCQ / TRUE_FALSE)
       answer    TEXT,          -- JSON string (respuesta correcta)
       points    INTEGER NOT NULL DEFAULT 1,
-      createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY(examId) REFERENCES "Exam"(id) ON DELETE CASCADE
+      "createdAt" TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY("examId") REFERENCES "Exam"(id) ON DELETE CASCADE
     );
   `);
+
+  await repairQuestionLiteSchema();
+  await logLiteSchemaOnce();
 }
 async function ensureExamChatTable() {
   await prisma.$executeRawUnsafe(`
@@ -223,7 +513,7 @@ async function ensureExamChatTable() {
       "authorName" TEXT NOT NULL,
       "message" TEXT NOT NULL,
       "broadcast" INTEGER NOT NULL DEFAULT 0,
-      "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      "createdAt" TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY("examId") REFERENCES "Exam"("id") ON DELETE CASCADE
     );
   `);
@@ -232,63 +522,10 @@ async function ensureExamChatTable() {
     CREATE INDEX IF NOT EXISTS "idx_ExamChatLite_exam_created"
     ON "ExamChatLite"("examId","createdAt");
   `);
+
+  await repairExamChatLiteSchema();
+  await logLiteSchemaOnce();
 }
-/**
- * GET /api/exams
- * Lista exámenes, opcionalmente filtrando por teacherName y/o subject.
- * Ejemplo:
- *   GET /api/exams?teacherName=Gomez
- */
-examsRouter.get("/exams", async (req, res) => {
-  try {
-    const teacherNameRaw = String(req.query.teacherName ?? "").trim();
-    const subjectRaw = String(req.query.subject ?? "").trim();
-
-    const where: any = {};
-
-    if (teacherNameRaw) {
-      where.teacherName = {
-        contains: teacherNameRaw,
-        mode: "insensitive",
-      };
-    }
-
-    if (subjectRaw) {
-      where.subject = {
-        contains: subjectRaw,
-        mode: "insensitive",
-      };
-    }
-
-    const exams = await prisma.exam.findMany({
-      where,
-      orderBy: {
-        createdAt: "desc", // si por alguna razón no existe, podés cambiarlo a id
-      },
-    });
-
-    const items = exams.map((e: any) => ({
-      id: e.id,
-      code: e.publicCode ?? e.id.slice(0, 6),
-      title: e.title ?? "(sin título)",
-      subject: e.subject ?? null,
-      teacherName: e.teacherName ?? null,
-      status: e.status ?? "DRAFT",
-      openAt: e.openAt ? e.openAt.toISOString() : null,
-      createdAt: e.createdAt ? e.createdAt.toISOString() : null,
-    }));
-
-    return res.json({ exams: items });
-  } catch (e: any) {
-    console.error("LIST_EXAMS_ERROR", e);
-    return res.status(500).json({ error: e?.message || "LIST_EXAMS_ERROR" });
-  }
-});
-
-/* -------------------------------------------------------------------------- */
-/*                               RUTAS DOCENTE                                */
-/* -------------------------------------------------------------------------- */
-
 /**
  * GET /api/exams/by-code/:code
  * Endpoint público para que el alumno busque examen por su código.
@@ -334,6 +571,7 @@ examsRouter.get("/exams/:code", async (req, res) => {
 });
 /** GET /api/exams/:code/chat  (lista los últimos mensajes del examen) */
 examsRouter.get("/exams/:code/chat", async (req, res) => {
+  let sql = "";
   try {
     await ensureExamChatTable();
 
@@ -343,14 +581,15 @@ examsRouter.get("/exams/:code/chat", async (req, res) => {
     }
 
     // Traemos hasta 100 mensajes, ordenados por fecha
-    const rows: any[] = await prisma.$queryRawUnsafe(
-      `
-      SELECT id, fromRole, authorName, message, broadcast, createdAt
+    sql = `
+      SELECT "id", "fromRole", "authorName", "message", "broadcast", "createdAt"
       FROM "ExamChatLite"
-      WHERE examId = ?
-      ORDER BY createdAt ASC
+      WHERE "examId" = $1
+      ORDER BY "createdAt" ASC
       LIMIT 100
-    `,
+    `;
+    const rows: any[] = await prisma.$queryRawUnsafe(
+      sql,
       exam.id
     );
 
@@ -365,6 +604,7 @@ examsRouter.get("/exams/:code/chat", async (req, res) => {
 
     return res.json({ items });
   } catch (e: any) {
+    logRawError("/api/exams/:code/chat", sql, e);
     console.error("CHAT_LIST_ERROR", e);
     return res.status(500).json({ error: e?.message || "CHAT_LIST_ERROR" });
   }
@@ -396,16 +636,11 @@ examsRouter.put("/exams/:code", async (req, res) => {
       data.title = body.title.trim();
     }
 
-    // 🔹 duración: soportamos durationMinutes o durationMin
-    if (body.durationMinutes !== undefined && body.durationMinutes !== null) {
-      const v = Number(body.durationMinutes);
-      if (!Number.isNaN(v) && v >= 0) {
-        const mins = Math.floor(v);
-        data.durationMin = mins;
-        data.durationMins = mins;
-      }
-    } else if (body.durationMin !== undefined && body.durationMin !== null) {
-      const v = Number(body.durationMin);
+    // 🔹 duración: soportamos durationMinutes, durationMin, durationMins
+    const durationRaw =
+      body.durationMinutes ?? body.durationMin ?? body.durationMins ?? null;
+    if (durationRaw !== null && durationRaw !== undefined) {
+      const v = Number(durationRaw);
       if (!Number.isNaN(v) && v >= 0) {
         const mins = Math.floor(v);
         data.durationMin = mins;
@@ -419,6 +654,12 @@ examsRouter.put("/exams/:code", async (req, res) => {
       data.lives = v;
     }
 
+    // gradingMode: manual | auto
+    if (body.gradingMode !== undefined) {
+      const gm = String(body.gradingMode || "").toLowerCase();
+      data.gradingMode = gm === "manual" ? "manual" : "auto";
+    }
+
     // abrir/cerrar examen
     if (typeof body.isOpen === "boolean") {
       data.status = (body.isOpen ? "OPEN" : "DRAFT") as any;
@@ -428,6 +669,13 @@ examsRouter.put("/exams/:code", async (req, res) => {
       where: { id: exam.id },
       data,
     });
+
+    if (process.env.NODE_ENV !== "production" && data.gradingMode) {
+      console.log("EXAM_GRADINGMODE_UPDATED", {
+        examId: exam.id,
+        gradingMode: data.gradingMode,
+      });
+    }
 
     return res.json({ exam: toExamResponse(updated) });
   } catch (e: any) {
@@ -483,6 +731,18 @@ examsRouter.put("/exams/:code/meta", async (req, res) => {
       data.gradingMode = gm === "manual" ? "manual" : "auto";
     }
 
+    // duración (meta): soporta durationMin/durationMins
+    const durationRaw =
+      body.durationMin ?? body.durationMins ?? null;
+    if (durationRaw !== null && durationRaw !== undefined) {
+      const v = Number(durationRaw);
+      if (!Number.isNaN(v) && v >= 0) {
+        const mins = Math.floor(v);
+        data.durationMin = mins;
+        data.durationMins = mins;
+      }
+    }
+
     if (body.maxScore !== undefined && body.maxScore !== null) {
       const v = Number(body.maxScore);
       data.maxScore = Number.isNaN(v) ? null : Math.max(0, Math.floor(v));
@@ -515,14 +775,36 @@ examsRouter.put("/exams/:code/meta", async (req, res) => {
  * Usado por el TABLERO del docente.
  * Devuelve intentos con vidas, pausa y violaciones (a partir de Event).
  */
-examsRouter.get("/exams/:code/attempts", async (req, res) => {
+examsRouter.get("/exams/:code/attempts", authMiddleware, async (req, res) => {
   try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ error: "UNAUTHORIZED" });
+
     const exam = await findExamByCode(req.params.code);
     if (!exam) return res.status(404).json({ error: "EXAM_NOT_FOUND" });
 
+    const isBandeja =
+      String(req.query.view || "").toLowerCase() === "bandeja";
+    const allowed = await hasExamRole(
+      exam,
+      userId,
+      isBandeja
+        ? [ExamRole.OWNER, ExamRole.GRADER, ExamRole.PROCTOR]
+        : [ExamRole.OWNER, ExamRole.PROCTOR]
+    );
+    if (!allowed) {
+      return res.status(403).json({ error: "FORBIDDEN" });
+    }
+
     const attempts = await prisma.attempt.findMany({
-      where: { examId: exam.id },
-      orderBy: { startAt: "asc" },
+      where: isBandeja
+        ? {
+            examId: exam.id,
+            endAt: { not: null },
+            status: { in: ["submitted", "in_review", "graded"] },
+          }
+        : { examId: exam.id },
+      orderBy: isBandeja ? { endAt: "desc" } : { startAt: "asc" },
       select: {
         id: true,
         studentName: true,
@@ -532,10 +814,38 @@ examsRouter.get("/exams/:code/attempts", async (req, res) => {
         endAt: true,
         status: true,
         score: true, // 👈 NUEVO: necesario para mostrar puntaje
+        extraTimeSecs: true,
       },
     });
 
-    const ids = attempts.map((a) => a.id);
+    const normalizedAttempts = await Promise.all(
+      attempts.map(async (a) => {
+        if (a.endAt) return a;
+
+        let examForExpire: any = exam as any;
+        if (examForExpire?.durationMin === undefined && examForExpire?.durationMins === undefined) {
+          examForExpire = await prisma.exam.findUnique({
+            where: { id: exam.id },
+            select: { id: true, durationMin: true, durationMins: true, gradingMode: true },
+          });
+        }
+
+        if (process.env.NODE_ENV !== "production") {
+          console.log("EXPIRE_CHECK", {
+            examId: exam.id,
+            durationMins: (examForExpire as any)?.durationMins ?? null,
+            durationMin: (examForExpire as any)?.durationMin ?? null,
+            gradingMode: (examForExpire as any)?.gradingMode ?? null,
+            attemptId: a.id,
+            status: a.status,
+          });
+        }
+
+        return await finalizeAttemptIfExpired(a as any, examForExpire as any);
+      })
+    );
+
+    const ids = normalizedAttempts.map((a) => a.id);
     const events = await prisma.event.findMany({
       where: { attemptId: { in: ids } },
       select: { attemptId: true, type: true, reason: true, ts: true },
@@ -578,7 +888,7 @@ examsRouter.get("/exams/:code/attempts", async (req, res) => {
       data.typesMap.set(rUpper, (data.typesMap.get(rUpper) ?? 0) + 1);
     }
 
-    const out = attempts.map((a) => {
+    const out = normalizedAttempts.map((a) => {
       const used = a.livesUsed ?? 0;
       const maxLives = exam.lives ?? 3;
       const remaining = Math.max(0, maxLives - used);
@@ -619,6 +929,18 @@ examsRouter.get("/exams/:code/attempts", async (req, res) => {
       };
     });
 
+    if (String(req.query.view || "").toLowerCase() === "bandeja") {
+      const minimal = normalizedAttempts.map((a) => ({
+        id: a.id,
+        studentName: a.studentName || "(sin nombre)",
+        studentEmail: null,
+        submittedAt: a.endAt ?? null,
+        status: a.status ?? "in_progress",
+        score: a.score ?? null,
+      }));
+      return res.json(minimal);
+    }
+
     return res.json({
       exam: {
         id: exam.id,
@@ -631,6 +953,248 @@ examsRouter.get("/exams/:code/attempts", async (req, res) => {
     });
   } catch (e: any) {
     return res.status(500).json({ error: e?.message || String(e) });
+  }
+});
+
+/**
+ * GET /api/grading/manual-exams
+ * Lista exámenes en modo corrección manual con conteos de intentos.
+ */
+examsRouter.get("/grading/manual-exams", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ error: "UNAUTHORIZED" });
+
+    const memberships = await prisma.examMember.findMany({
+      where: {
+        userId,
+        role: { in: [ExamRole.OWNER, ExamRole.GRADER, ExamRole.PROCTOR] },
+      },
+      select: {
+        examId: true,
+        exam: {
+          select: {
+            id: true,
+            ownerId: true,
+            publicCode: true,
+            title: true,
+            gradingMode: true,
+          },
+        },
+      },
+    });
+
+    const ownedExams = await prisma.exam.findMany({
+      where: { ownerId: userId },
+      select: {
+        id: true,
+        ownerId: true,
+        publicCode: true,
+        title: true,
+        gradingMode: true,
+      },
+    });
+
+    const byId = new Map<string, typeof ownedExams[number]>();
+    for (const m of memberships) byId.set(m.exam.id, m.exam);
+    for (const e of ownedExams) byId.set(e.id, e);
+
+    const manualExams = Array.from(byId.values()).filter(
+      (e) => String(e.gradingMode || "").toLowerCase() === "manual"
+    );
+
+    if (!manualExams.length) {
+      return res.json([]);
+    }
+
+    // Optional backfill: asegurar ExamMember OWNER para exámenes propios
+    const ownedManual = manualExams.filter((e) => e.ownerId === userId);
+    if (ownedManual.length) {
+      await Promise.all(
+        ownedManual.map((e) =>
+          prisma.examMember.upsert({
+            where: { examId_userId: { examId: e.id, userId } },
+            update: { role: ExamRole.OWNER },
+            create: { examId: e.id, userId, role: ExamRole.OWNER },
+          })
+        )
+      );
+    }
+
+    const examIds = manualExams.map((e) => e.id);
+
+    const submittedAgg = await prisma.attempt.groupBy({
+      by: ["examId"],
+      where: {
+        examId: { in: examIds },
+        endAt: { not: null },
+      },
+      _count: { _all: true },
+      _max: { endAt: true },
+    });
+
+    const pendingAgg = await prisma.attempt.groupBy({
+      by: ["examId"],
+      where: {
+        examId: { in: examIds },
+        endAt: { not: null },
+        OR: [
+          { status: { in: ["submitted", "in_review"] } },
+          { score: null },
+        ],
+      },
+      _count: { _all: true },
+    });
+
+    const submittedByExam = new Map(
+      submittedAgg.map((a) => [
+        a.examId,
+        {
+          submittedCount: a._count._all,
+          lastSubmissionAt: a._max.endAt,
+        },
+      ])
+    );
+
+    const pendingByExam = new Map(
+      pendingAgg.map((a) => [a.examId, a._count._all])
+    );
+
+    const items = manualExams.map((exam) => {
+      const submitted = submittedByExam.get(exam.id);
+      return {
+        code: exam.publicCode ?? exam.id.slice(0, 6),
+        title: exam.title,
+        pendingCount: pendingByExam.get(exam.id) ?? 0,
+        submittedCount: submitted?.submittedCount ?? 0,
+        lastSubmissionAt: submitted?.lastSubmissionAt ?? null,
+      };
+    });
+
+    return res.json(items);
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || String(e) });
+  }
+});
+
+/**
+ * POST /api/exams/:code/invites
+ * Body: { email, role? }
+ */
+examsRouter.post("/exams/:code/invites", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ error: "UNAUTHORIZED" });
+
+    const exam = await findExamByCode(req.params.code);
+    if (!exam) return res.status(404).json({ error: "EXAM_NOT_FOUND" });
+
+    const allowed = await hasExamRole(exam, userId, [ExamRole.OWNER]);
+    if (!allowed) return res.status(403).json({ error: "FORBIDDEN" });
+
+    const rawEmail = String(req.body?.email ?? "").trim().toLowerCase();
+    if (!rawEmail) return res.status(400).json({ error: "EMAIL_REQUIRED" });
+
+    const rawRole = String(req.body?.role ?? "GRADER").toUpperCase();
+    if (rawRole !== "GRADER" && rawRole !== "PROCTOR") {
+      return res.status(400).json({ error: "INVALID_ROLE" });
+    }
+    const role =
+      rawRole === "PROCTOR" ? ExamRole.PROCTOR : ExamRole.GRADER;
+
+    const token = crypto.randomBytes(32).toString("hex");
+    const tokenHash = crypto
+      .createHash("sha256")
+      .update(token)
+      .digest("hex");
+
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+
+    await prisma.examInvite.create({
+      data: {
+        examId: exam.id,
+        email: rawEmail,
+        role,
+        tokenHash,
+        expiresAt,
+        invitedByUserId: userId,
+      },
+    });
+
+    const baseUrl =
+      process.env.FRONTEND_BASE_URL?.trim() || "http://localhost:3000";
+    const inviteLink = `${baseUrl}/invite?token=${token}`;
+
+    return res.json({ ok: true, inviteLink, expiresAt });
+  } catch (e: any) {
+    if (process.env.NODE_ENV !== "production") {
+      console.error("INVITE_CREATE_ERROR", e);
+    }
+    return res.status(500).json({ error: e?.message || "INVITE_CREATE_ERROR" });
+  }
+});
+
+/**
+ * POST /api/invites/accept
+ * Body: { token }
+ */
+examsRouter.post("/invites/accept", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user?.userId;
+    const userEmail = String(req.user?.email ?? "").trim().toLowerCase();
+    if (!userId) return res.status(401).json({ error: "UNAUTHORIZED" });
+
+    const token = String(req.body?.token ?? "").trim();
+    if (!token) return res.status(400).json({ error: "TOKEN_REQUIRED" });
+
+    const tokenHash = crypto
+      .createHash("sha256")
+      .update(token)
+      .digest("hex");
+
+    const invite = await prisma.examInvite.findFirst({
+      where: {
+        tokenHash,
+        acceptedAt: null,
+        expiresAt: { gt: new Date() },
+      },
+      include: {
+        exam: { select: { publicCode: true } },
+      },
+    });
+    if (!invite) return res.status(404).json({ error: "INVITE_NOT_FOUND" });
+
+    if (invite.email.trim().toLowerCase() !== userEmail) {
+      return res.status(403).json({ error: "EMAIL_MISMATCH" });
+    }
+
+    await prisma.examMember.upsert({
+      where: {
+        examId_userId: { examId: invite.examId, userId },
+      },
+      update: { role: invite.role },
+      create: {
+        examId: invite.examId,
+        userId,
+        role: invite.role,
+      },
+    });
+
+    await prisma.examInvite.update({
+      where: { id: invite.id },
+      data: { acceptedAt: new Date() },
+    });
+
+    return res.json({
+      ok: true,
+      examCode: invite.exam.publicCode,
+      role: invite.role,
+    });
+  } catch (e: any) {
+    if (process.env.NODE_ENV !== "production") {
+      console.error("INVITE_ACCEPT_ERROR", e);
+    }
+    return res.status(500).json({ error: e?.message || "INVITE_ACCEPT_ERROR" });
   }
 });
 /**
@@ -696,10 +1260,10 @@ examsRouter.get("/exams/:code/activity.pdf", async (req, res) => {
     await ensureExamChatTable();
     const chatRows: any[] = await prisma.$queryRawUnsafe(
       `
-      SELECT id, fromRole, authorName, message, broadcast, createdAt
+      SELECT "id", "fromRole", "authorName", "message", "broadcast", "createdAt"
       FROM "ExamChatLite"
-      WHERE examId = ?
-      ORDER BY createdAt ASC
+      WHERE "examId" = $1
+      ORDER BY "createdAt" ASC
     `,
       exam.id
     );
@@ -852,6 +1416,7 @@ examsRouter.post("/exams/:code/attempts/mock", async (req, res) => {
  * Body: { fromRole: 'student' | 'teacher'; authorName: string; message: string }
  */
 examsRouter.post("/exams/:code/chat", async (req, res) => {
+  let sql = "";
   try {
     await ensureExamChatTable();
 
@@ -874,12 +1439,13 @@ examsRouter.post("/exams/:code/chat", async (req, res) => {
 
     const id = crypto.randomUUID();
 
-    await prisma.$executeRawUnsafe(
-      `
+    sql = `
       INSERT INTO "ExamChatLite"
-        (id, examId, fromRole, authorName, message, broadcast)
-      VALUES (?, ?, ?, ?, ?, 0)
-    `,
+        ("id", "examId", "fromRole", "authorName", "message", "broadcast")
+      VALUES ($1, $2, $3, $4, $5, 0)
+    `;
+    await prisma.$executeRawUnsafe(
+      sql,
       id,
       exam.id,
       role,
@@ -889,6 +1455,7 @@ examsRouter.post("/exams/:code/chat", async (req, res) => {
 
     return res.json({ ok: true, id });
   } catch (e: any) {
+    logRawError("/api/exams/:code/chat", sql, e);
     console.error("CHAT_SEND_ERROR", e);
     return res.status(500).json({ error: e?.message || "CHAT_SEND_ERROR" });
   }
@@ -899,6 +1466,7 @@ examsRouter.post("/exams/:code/chat", async (req, res) => {
  * fromRole se fuerza a 'teacher' y broadcast = 1
  */
 examsRouter.post("/exams/:code/chat/broadcast", async (req, res) => {
+  let sql = "";
   try {
     await ensureExamChatTable();
 
@@ -917,12 +1485,13 @@ examsRouter.post("/exams/:code/chat/broadcast", async (req, res) => {
 
     const id = crypto.randomUUID();
 
-    await prisma.$executeRawUnsafe(
-      `
+    sql = `
       INSERT INTO "ExamChatLite"
-        (id, examId, fromRole, authorName, message, broadcast)
-      VALUES (?, ?, 'teacher', ?, ?, 1)
-    `,
+        ("id", "examId", "fromRole", "authorName", "message", "broadcast")
+      VALUES ($1, $2, 'teacher', $3, $4, 1)
+    `;
+    await prisma.$executeRawUnsafe(
+      sql,
       id,
       exam.id,
       name,
@@ -931,6 +1500,7 @@ examsRouter.post("/exams/:code/chat/broadcast", async (req, res) => {
 
     return res.json({ ok: true, id });
   } catch (e: any) {
+    logRawError("/api/exams/:code/chat/broadcast", sql, e);
     console.error("CHAT_BROADCAST_ERROR", e);
     return res
       .status(500)
@@ -950,9 +1520,10 @@ examsRouter.post("/exams/:code/chat/broadcast", async (req, res) => {
 // POST /api/exams/:code/attempts/start
 examsRouter.post("/exams/:code/attempts/start", async (req, res) => {
   try {
-    const { studentName } = req.body ?? {};
+    const { studentName, studentEmail } = req.body ?? {};
+    const email = String(studentEmail || "").trim().toLowerCase();
     const name = String(studentName || "").trim();
-    if (!name) {
+    if (!email && !name) {
       return res.status(400).json({ error: "MISSING_NAME" });
     }
 
@@ -961,13 +1532,58 @@ examsRouter.post("/exams/:code/attempts/start", async (req, res) => {
       return res.status(404).json({ error: "EXAM_NOT_FOUND" });
     }
 
-    const studentId = `s-${crypto.randomUUID()}`;
+    const studentKey = email ? `email:${email}` : `name:${name}`;
+
+    const inProgress = await prisma.attempt.findFirst({
+      where: {
+        examId: exam.id,
+        studentId: studentKey,
+        status: "in_progress",
+        endAt: null,
+      },
+    });
+
+    if (inProgress) {
+      const maybeFinal = await finalizeAttemptIfExpired(
+        inProgress as any,
+        exam as any
+      );
+      if (maybeFinal.endAt) {
+        return res
+          .status(409)
+          .json({ error: "ATTEMPT_ALREADY_SUBMITTED" });
+      }
+      return res.json({
+        attempt: {
+          id: inProgress.id,
+          studentName: inProgress.studentName,
+          startAt: inProgress.startAt,
+        },
+      });
+    }
+
+    const alreadySubmitted = await prisma.attempt.findFirst({
+      where: {
+        examId: exam.id,
+        studentId: studentKey,
+        OR: [
+          { endAt: { not: null } },
+          { status: { in: ["submitted", "in_review", "graded"] } },
+        ],
+      },
+    });
+
+    if (alreadySubmitted) {
+      return res.status(409).json({ error: "ATTEMPT_ALREADY_SUBMITTED" });
+    }
+
+    const studentId = studentKey;
 
     const attempt = await prisma.attempt.create({
       data: {
         examId: exam.id,
         studentId,
-        studentName: name,
+        studentName: name || email,
         status: "in_progress", // usá el mismo string que ya venías usando
         startAt: new Date(),
         endAt: null,
@@ -999,7 +1615,7 @@ examsRouter.post("/exams/:code/attempts/start", async (req, res) => {
  */
 examsRouter.get("/attempts/:id/summary", async (req, res) => {
   try {
-    const attempt = await prisma.attempt.findUnique({
+    let attempt = await prisma.attempt.findUnique({
       where: { id: req.params.id },
     });
 
@@ -1015,6 +1631,30 @@ examsRouter.get("/attempts/:id/summary", async (req, res) => {
       return res.status(404).json({ error: "EXAM_NOT_FOUND" });
     }
 
+    let examForExpire: any = exam as any;
+    if (examForExpire?.durationMin === undefined && examForExpire?.durationMins === undefined) {
+      examForExpire = await prisma.exam.findUnique({
+        where: { id: exam.id },
+        select: { id: true, durationMin: true, durationMins: true, gradingMode: true },
+      });
+    }
+
+    if (process.env.NODE_ENV !== "production") {
+      console.log("EXPIRE_CHECK", {
+        examId: exam.id,
+        durationMins: (examForExpire as any)?.durationMins ?? null,
+        durationMin: (examForExpire as any)?.durationMin ?? null,
+        gradingMode: (examForExpire as any)?.gradingMode ?? null,
+        attemptId: attempt.id,
+        status: attempt.status,
+      });
+    }
+
+    attempt = await finalizeAttemptIfExpired(attempt as any, examForExpire as any);
+    if (!attempt) {
+      return res.status(404).json({ error: "ATTEMPT_NOT_FOUND" });
+    }
+
     // VIDAS: Exam.lives - Attempt.livesUsed
     const maxLives = (exam as any).lives != null ? (exam as any).lives : 3;
     const used =
@@ -1024,7 +1664,7 @@ examsRouter.get("/attempts/:id/summary", async (req, res) => {
 
     // TIEMPO
     const durationMin =
-      (exam as any).durationMin ?? (exam as any).durationMins ?? null;
+      (exam as any).durationMins ?? (exam as any).durationMin ?? null;
 
     let secondsLeft: number | null = null;
 
@@ -1039,21 +1679,106 @@ examsRouter.get("/attempts/:id/summary", async (req, res) => {
       secondsLeft = Math.max(0, totalSecs - elapsedSecs);
     }
 
-    // Si se quedó sin tiempo y aún no está marcado como terminado, lo cerramos
-    if (secondsLeft === 0 && attempt.status !== "finished") {
-      await prisma.attempt.update({
-        where: { id: attempt.id },
-        data: {
-          status: "finished",
-          endAt: new Date(),
-        },
-      });
-    }
-
     return res.json({ remaining, secondsLeft });
   } catch (e: any) {
     console.error(e);
     return res.status(500).json({ error: e?.message || "SUMMARY_ERROR" });
+  }
+});
+
+/**
+ * PATCH /api/attempts/:attemptId/draft
+ * Body: { answers: [{ questionId, value }] }
+ */
+examsRouter.patch("/attempts/:attemptId/draft", async (req, res) => {
+  try {
+    const attemptId = String(req.params.attemptId || "").trim();
+    if (!attemptId) {
+      return res.status(400).json({ error: "ATTEMPT_ID_REQUIRED" });
+    }
+
+    const attempt = await prisma.attempt.findUnique({
+      where: { id: attemptId },
+      select: { id: true, status: true, endAt: true },
+    });
+    if (!attempt) return res.status(404).json({ error: "ATTEMPT_NOT_FOUND" });
+
+    if (attempt.endAt || attempt.status !== "in_progress") {
+      return res.status(409).json({ error: "ATTEMPT_CLOSED" });
+    }
+
+    const answers = Array.isArray(req.body?.answers) ? req.body.answers : null;
+    if (!answers) {
+      return res.status(400).json({ error: "ANSWERS_REQUIRED" });
+    }
+    if (answers.length > 200) {
+      return res.status(400).json({ error: "ANSWERS_TOO_LARGE" });
+    }
+
+    for (const item of answers) {
+      const questionId = String(item?.questionId || "").trim();
+      if (!questionId) continue;
+
+      const value = item?.value ?? null;
+      const size = JSON.stringify(value ?? null).length;
+      if (size > 20000) {
+        return res.status(400).json({ error: "ANSWER_VALUE_TOO_LARGE" });
+      }
+
+      await prisma.answer.upsert({
+        where: { attemptId_questionId: { attemptId, questionId } },
+        update: {
+          content: value === null ? Prisma.DbNull : value,
+        },
+        create: {
+          attemptId,
+          questionId,
+          content: value === null ? Prisma.DbNull : value,
+        },
+      });
+    }
+
+    return res.json({ ok: true });
+  } catch (e: any) {
+    if (process.env.NODE_ENV !== "production") {
+      console.error("DRAFT_SAVE_ERROR", e);
+    }
+    return res.status(500).json({ error: e?.message || "DRAFT_SAVE_ERROR" });
+  }
+});
+
+/**
+ * GET /api/attempts/:attemptId/draft
+ */
+examsRouter.get("/attempts/:attemptId/draft", async (req, res) => {
+  try {
+    const attemptId = String(req.params.attemptId || "").trim();
+    if (!attemptId) {
+      return res.status(400).json({ error: "ATTEMPT_ID_REQUIRED" });
+    }
+
+    const attempt = await prisma.attempt.findUnique({
+      where: { id: attemptId },
+      select: { id: true },
+    });
+    if (!attempt) return res.status(404).json({ error: "ATTEMPT_NOT_FOUND" });
+
+    const rows = await prisma.answer.findMany({
+      where: { attemptId },
+      select: { questionId: true, content: true },
+    });
+
+    const answers = rows.map((r) => ({
+      questionId: r.questionId,
+      value: unwrapAnswerContent(r.content).value ?? null,
+    }));
+
+    return res.json({ attemptId, answers });
+  } catch (e: any) {
+    if (process.env.NODE_ENV !== "production") {
+      console.error("DRAFT_LOAD_ERROR", e);
+    }
+    return res.status(500).json({ error: e?.message || "DRAFT_LOAD_ERROR" });
   }
 });
 
@@ -1281,19 +2006,21 @@ examsRouter.post("/attempts/:id/antifraud", async (req, res) => {
  * Devuelve el "paper" del examen: título + lista de preguntas desde QuestionLite.
  */
 examsRouter.get("/exams/:code/paper", async (req, res) => {
+  let sql = "";
   try {
     const exam = await findExamByCode(req.params.code);
     if (!exam) return res.status(404).json({ error: "EXAM_NOT_FOUND" });
 
     await ensureQuestionLite();
 
-    const list: any[] = await prisma.$queryRawUnsafe(
-      `
+    sql = `
       SELECT id, kind, stem, choices, answer, points
       FROM "QuestionLite"
-      WHERE examId = ?
-      ORDER BY createdAt ASC
-    `,
+      WHERE "examId" = $1
+      ORDER BY "createdAt" ASC
+    `;
+    const list: any[] = await prisma.$queryRawUnsafe(
+      sql,
       exam.id
     );
 
@@ -1339,6 +2066,7 @@ examsRouter.get("/exams/:code/paper", async (req, res) => {
       questions,
     });
   } catch (e: any) {
+    logRawError("/api/exams/:code/paper", sql, e);
     return res.status(500).json({ error: e?.message || String(e) });
   }
 });
@@ -1392,6 +2120,7 @@ function serializeAnswerContent(kind: any, value: any): string | null {
  * }
  */
 examsRouter.post("/attempts/:id/submit", async (req, res) => {
+  let sql = "";
   try {
     const attempt = await prisma.attempt.findUnique({
       where: { id: req.params.id },
@@ -1419,13 +2148,14 @@ examsRouter.post("/attempts/:id/submit", async (req, res) => {
 
     await ensureQuestionLite();
 
-    const qs: any[] = await prisma.$queryRawUnsafe(
-      `
+    sql = `
       SELECT id, kind, stem, choices, answer, points
       FROM "QuestionLite"
-      WHERE examId = ?
-      ORDER BY createdAt ASC
-    `,
+      WHERE "examId" = $1
+      ORDER BY "createdAt" ASC
+    `;
+    const qs: any[] = await prisma.$queryRawUnsafe(
+      sql,
       exam.id
     );
 
@@ -1571,6 +2301,7 @@ examsRouter.post("/attempts/:id/submit", async (req, res) => {
       maxScore: gradingMode === "auto" ? totalPoints : exam.maxScore ?? null,
     });
   } catch (e: any) {
+    logRawError("/api/attempts/:id/submit", sql, e);
     console.error("ATTEMPT_SUBMIT_ERROR", e);
     return res.status(500).json({ error: e?.message || String(e) });
   }
@@ -1581,6 +2312,7 @@ examsRouter.post("/attempts/:id/submit", async (req, res) => {
  * (versión mínima: solo disponible si gradingMode = auto y el intento terminó)
  */
 examsRouter.get("/attempts/:id/review", async (req, res) => {
+  let sql = "";
   try {
     const at = await prisma.attempt.findUnique({
       where: { id: req.params.id },
@@ -1626,13 +2358,14 @@ examsRouter.get("/attempts/:id/review", async (req, res) => {
 
     await ensureQuestionLite();
 
-    const qs: any[] = await prisma.$queryRawUnsafe(
-      `
+    sql = `
       SELECT id, kind, stem, choices, answer, points
       FROM "QuestionLite"
-      WHERE examId = ?
-      ORDER BY createdAt ASC
-    `,
+      WHERE "examId" = $1
+      ORDER BY "createdAt" ASC
+    `;
+    const qs: any[] = await prisma.$queryRawUnsafe(
+      sql,
       at.examId
     );
 
@@ -1659,7 +2392,7 @@ examsRouter.get("/attempts/:id/review", async (req, res) => {
       }
 
       const a = byQ.get(q.id);
-      const given = a?.content ?? null;
+      const given = unwrapAnswerContent(a?.content ?? null).value;
 
       return {
         id: q.id,
@@ -1692,9 +2425,238 @@ examsRouter.get("/attempts/:id/review", async (req, res) => {
       questions,
     });
   } catch (e: any) {
+    logRawError("/api/attempts/:id/review", sql, e);
     return res.status(500).json({ error: e?.message || String(e) });
   }
 });
+
+/**
+ * GET /api/exams/:code/attempts/:attemptId/grading
+ * Corrección manual: devuelve preguntas + respuestas + puntajes docentes.
+ */
+examsRouter.get(
+  "/exams/:code/attempts/:attemptId/grading",
+  authMiddleware,
+  async (req, res) => {
+    let sql = "";
+    try {
+      const userId = req.user?.userId;
+      if (!userId) return res.status(401).json({ error: "UNAUTHORIZED" });
+
+      const exam = await findExamByCode(req.params.code);
+      if (!exam) return res.status(404).json({ error: "EXAM_NOT_FOUND" });
+
+      const allowed = await hasExamRole(exam, userId, [
+        ExamRole.OWNER,
+        ExamRole.GRADER,
+        ExamRole.PROCTOR,
+      ]);
+      if (!allowed) {
+        return res.status(403).json({ error: "FORBIDDEN" });
+      }
+
+      const attempt = await prisma.attempt.findFirst({
+        where: { id: req.params.attemptId, examId: exam.id },
+      });
+      if (!attempt) return res.status(404).json({ error: "ATTEMPT_NOT_FOUND" });
+
+      await ensureQuestionLite();
+
+      sql = `
+        SELECT id, kind, stem, choices, answer, points
+        FROM "QuestionLite"
+        WHERE "examId" = $1
+        ORDER BY "createdAt" ASC
+      `;
+      const qs: any[] = await prisma.$queryRawUnsafe(sql, exam.id);
+
+      const answers = await prisma.answer.findMany({
+        where: { attemptId: attempt.id },
+        select: { questionId: true, content: true, score: true },
+      });
+      const byQ = new Map(answers.map((a) => [a.questionId, a]));
+
+      let maxPoints = 0;
+      let currentScore = 0;
+
+      const questions = qs.map((q) => {
+        let options: any = null;
+        try {
+          options = q.choices ? JSON.parse(String(q.choices)) : null;
+        } catch {
+          options = null;
+        }
+
+        let correctAnswer: any = null;
+        try {
+          correctAnswer = q.answer ? JSON.parse(String(q.answer)) : null;
+        } catch {
+          correctAnswer = null;
+        }
+
+        const max = Number(q.points ?? 1) || 1;
+        maxPoints += max;
+
+        const a = byQ.get(q.id);
+        const unwrapped = unwrapAnswerContent(a?.content ?? null);
+        const score = typeof a?.score === "number" ? a.score : null;
+        if (typeof score === "number") currentScore += score;
+
+        return {
+          questionId: q.id,
+          type: normalizeQuestionKind(q.kind),
+          prompt: q.stem,
+          options,
+          correctAnswer,
+          maxPoints: max,
+          studentAnswer: unwrapped.value ?? null,
+          teacherScore: score,
+          teacherFeedback: unwrapped.teacherFeedback,
+        };
+      });
+
+      return res.json({
+        attempt: {
+          id: attempt.id,
+          studentName: attempt.studentName ?? null,
+          status: attempt.status ?? null,
+          submittedAt: attempt.endAt ?? null,
+          score: attempt.score ?? null,
+        },
+        questions,
+        totals: {
+          maxPoints,
+          currentScore,
+        },
+      });
+    } catch (e: any) {
+      logRawError("/api/exams/:code/attempts/:attemptId/grading", sql, e);
+      if (process.env.NODE_ENV !== "production") {
+        console.error("GRADING_GET_ERROR", e);
+      }
+      return res.status(500).json({ error: e?.message || String(e) });
+    }
+  }
+);
+
+/**
+ * PATCH /api/exams/:code/attempts/:attemptId/grading
+ * Body: { perQuestion: [{ questionId, score, feedback? }], finalize?: boolean }
+ */
+examsRouter.patch(
+  "/exams/:code/attempts/:attemptId/grading",
+  authMiddleware,
+  async (req, res) => {
+    try {
+      const userId = req.user?.userId;
+      if (!userId) return res.status(401).json({ error: "UNAUTHORIZED" });
+
+      const exam = await findExamByCode(req.params.code);
+      if (!exam) return res.status(404).json({ error: "EXAM_NOT_FOUND" });
+
+      const allowed = await hasExamRole(exam, userId, [
+        ExamRole.OWNER,
+        ExamRole.GRADER,
+        ExamRole.PROCTOR,
+      ]);
+      if (!allowed) {
+        return res.status(403).json({ error: "FORBIDDEN" });
+      }
+
+      const attempt = await prisma.attempt.findFirst({
+        where: { id: req.params.attemptId, examId: exam.id },
+      });
+      if (!attempt) return res.status(404).json({ error: "ATTEMPT_NOT_FOUND" });
+
+      const body = req.body ?? {};
+      const perQuestion = Array.isArray(body.perQuestion)
+        ? body.perQuestion
+        : null;
+      if (!perQuestion) {
+        return res.status(400).json({ error: "PER_QUESTION_REQUIRED" });
+      }
+
+      for (const item of perQuestion) {
+        const questionId = String(item?.questionId || "").trim();
+        if (!questionId) continue;
+
+        const scoreRaw = item?.score;
+        const score =
+          scoreRaw === null || scoreRaw === undefined
+            ? null
+            : Math.max(0, Number(scoreRaw));
+        if (score !== null && Number.isNaN(score)) {
+          return res.status(400).json({ error: "SCORE_INVALID" });
+        }
+
+        const feedback =
+          item?.feedback !== undefined ? String(item.feedback) : undefined;
+
+        const existing = await prisma.answer.findFirst({
+          where: { attemptId: attempt.id, questionId },
+        });
+
+        if (existing) {
+          const data: any = {};
+          if (score !== null) data.score = score;
+          if (feedback !== undefined) {
+            data.content = wrapAnswerContent(existing.content, feedback);
+          }
+          if (Object.keys(data).length > 0) {
+            await prisma.answer.update({
+              where: { id: existing.id },
+              data,
+            });
+          }
+        } else {
+          await prisma.answer.create({
+            data: {
+              attemptId: attempt.id,
+              questionId,
+              score: score ?? null,
+              content:
+                feedback !== undefined
+                  ? wrapAnswerContent(null, feedback)
+                  : Prisma.DbNull,
+            },
+          });
+        }
+      }
+
+      const allAnswers = await prisma.answer.findMany({
+        where: { attemptId: attempt.id },
+        select: { score: true },
+      });
+      const totalScore = allAnswers.reduce((sum, a) => {
+        return sum + (typeof a.score === "number" ? a.score : 0);
+      }, 0);
+
+      const finalize = body.finalize === true;
+      const dataToUpdate: any = {
+        score: totalScore,
+      };
+      if (finalize) dataToUpdate.status = "graded";
+
+      const updatedAttempt = await prisma.attempt.update({
+        where: { id: attempt.id },
+        data: dataToUpdate,
+        select: { id: true, status: true, score: true },
+      });
+
+      return res.json({
+        ok: true,
+        attemptId: updatedAttempt.id,
+        status: updatedAttempt.status,
+        totalScore: updatedAttempt.score ?? null,
+      });
+    } catch (e: any) {
+      if (process.env.NODE_ENV !== "production") {
+        console.error("GRADING_PATCH_ERROR", e);
+      }
+      return res.status(500).json({ error: e?.message || String(e) });
+    }
+  }
+);
 // DELETE /api/exams/:id
 // Elimina un examen y todas sus dependencias (attempts, answers, events, messages, questions)
 examsRouter.delete("/exams/:id", async (req, res) => {

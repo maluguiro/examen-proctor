@@ -1,24 +1,28 @@
-// Servidor principal del sistema de exámenes con proctor antifraude.
+﻿// Servidor principal del sistema de exámenes con proctor antifraude.
 // api/src/index.ts
 import express from "express";
 import cors from "cors";
 import "dotenv/config";
 import crypto from "crypto";
+import "dotenv/config";
 
 // Importamos nuevas rutas
 import { authRouter } from "./routes/auth";
 import { teacherRouter } from "./routes/teacher";
-import { authMiddleware, optionalAuthMiddleware } from "./authMiddleware";
+import { authMiddleware } from "./authMiddleware";
 
 import { examsRouter } from "./routes/exams";
 import { questionsRouter } from "./routes/questions";
 import { prisma } from "./prisma";
-import { ExamStatus } from "@prisma/client";
+import { ExamRole, ExamStatus } from "@prisma/client";
 
 const app = express();
 const allowedOrigins = new Set<string>(["http://localhost:3000"]);
 if (process.env.CORS_ORIGIN) {
-  allowedOrigins.add(process.env.CORS_ORIGIN);
+  process.env.CORS_ORIGIN.split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean)
+    .forEach((origin) => allowedOrigins.add(origin));
 }
 app.use(
   cors({
@@ -81,9 +85,29 @@ app.get("/api/health", (_req, res) => res.json({ ok: true }));
 //    body: { title, lives?, durationMins? }
 // body: { title, lives?, durationMins? }
 // GET /api/exams
-app.get("/api/exams", async (_req, res) => {
+app.get("/api/exams", authMiddleware, async (req, res) => {
   try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ error: "NO_TOKEN_PROVIDED" });
+    }
+
     const items = await prisma.exam.findMany({
+      where: {
+        OR: [
+          { ownerId: userId },
+          {
+            members: {
+              some: {
+                userId,
+                role: {
+                  in: [ExamRole.OWNER, ExamRole.GRADER, ExamRole.PROCTOR],
+                },
+              },
+            },
+          },
+        ],
+      },
       orderBy: {
         createdAt: "desc",
       },
@@ -97,8 +121,14 @@ app.get("/api/exams", async (_req, res) => {
         durationMin: true,
         durationMins: true,
         lives: true,
+        university: true,
+        subject: true,
       },
     });
+
+    if (process.env.NODE_ENV !== "production") {
+      console.log("EXAMS_LIST_SCOPE", { userId, count: items.length });
+    }
 
     // Adaptamos lo que viene de la DB al formato que espera el frontend
     const shaped = items.map((e) => {
@@ -115,6 +145,8 @@ app.get("/api/exams", async (_req, res) => {
         // 👇 este nombre sí lo usamos hacia el front
         durationMinutes,
         lives: e.lives,
+        university: e.university ?? null,
+        subject: e.subject ?? null,
       };
     });
 
@@ -127,10 +159,15 @@ app.get("/api/exams", async (_req, res) => {
 // ✅ CREAR EXAMEN
 //    POST /api/exams
 //    body: { title, lives?, durationMinutes?, userSubject?, userUniversity? }
-//    Ahora soporta AUTH OPCIONAL. Si hay token, usa el userId como ownerId.
-app.post("/api/exams", optionalAuthMiddleware, async (req, res) => {
+//    Requiere AUTH. Usa el userId como ownerId.
+app.post("/api/exams", authMiddleware, async (req, res) => {
   try {
     const body = req.body ?? {};
+
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ error: "NO_TOKEN_PROVIDED" });
+    }
 
     const rawTitle = body.title ?? "";
     const title = String(rawTitle).trim();
@@ -155,25 +192,22 @@ app.post("/api/exams", optionalAuthMiddleware, async (req, res) => {
         : Math.max(0, Math.floor(Number(rawDuration) || 0));
 
     // Auth: Si hay usuario logueado, lo usamos como owner
-    let ownerId = process.env.DEFAULT_OWNER_ID || "docente-local";
-    let teacherName: string | null = null;
-
-    // Auth: Si hay usuario logueado, lo usamos como owner (PRIORIDAD AL TOKEN)
-    if (req.user?.userId) {
-      ownerId = req.user.userId;
-    }
-
-    // Si NO hay token (caso opcional), ownerId queda como default o lo que venga (si permitimos suplantación, pero mejor priorizar seguridad)
-    // Para este fix, nos aseguramos que si hay user, se use.
-
-    if (req.user?.userId) {
-      ownerId = req.user.userId;
-      // Intentar obtener nombre si lo tenemos a mano, o dejarlo null para que el perfil lo controle
-      // Podríamos buscar el perfil, pero por performance quizás baste con lo que venga en el body o default
-    }
+    const ownerId = userId;
+    const teacherName: string | null = null;
 
     // Campos adicionales (university, subject)
-    const subject = body.userSubject ? String(body.userSubject).trim() : null;
+    const university =
+      body.university !== undefined && body.university !== null
+        ? String(body.university).trim() || null
+        : null;
+    const subjectRaw =
+      body.subject !== undefined && body.subject !== null
+        ? body.subject
+        : body.userSubject;
+    const subject =
+      subjectRaw !== undefined && subjectRaw !== null
+        ? String(subjectRaw).trim() || null
+        : null;
 
     const publicCode = await generateExamPublicCode();
 
@@ -184,12 +218,31 @@ app.post("/api/exams", optionalAuthMiddleware, async (req, res) => {
         lives,
         durationMin,
         durationMins: durationMin,
-        ownerId: ownerId ?? process.env.DEFAULT_OWNER_ID ?? "docente-local",
+        ownerId,
         publicCode,
+        university,
         subject,
         teacherName,
       },
     });
+
+    try {
+      await prisma.examMember.upsert({
+        where: { examId_userId: { examId: exam.id, userId } },
+        create: {
+          examId: exam.id,
+          userId,
+          role: ExamRole.OWNER,
+        },
+        update: { role: ExamRole.OWNER },
+      });
+    } catch (e) {
+      console.error("CREATE_EXAM_MEMBER_ERROR", e);
+    }
+
+    if (process.env.NODE_ENV !== "production") {
+      console.log("EXAM_CREATED", { examId: exam.id, ownerId });
+    }
 
     const durationRaw2 = exam.durationMin ?? exam.durationMins ?? null;
     const durationMinutes =
