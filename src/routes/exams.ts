@@ -2659,10 +2659,15 @@ examsRouter.patch(
 );
 // DELETE /api/exams/:id
 // Elimina un examen y todas sus dependencias (attempts, answers, events, messages, questions)
-examsRouter.delete("/exams/:id", async (req, res) => {
+examsRouter.delete("/exams/:id", authMiddleware, async (req, res) => {
   const examId = req.params.id;
 
   try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ error: "UNAUTHORIZED" });
+    }
+
     const exam = await prisma.exam.findUnique({
       where: { id: examId },
     });
@@ -2671,43 +2676,68 @@ examsRouter.delete("/exams/:id", async (req, res) => {
       return res.status(404).json({ error: "EXAM_NOT_FOUND" });
     }
 
-    // 1) Traer IDs de intentos de ese examen
-    const attempts = await prisma.attempt.findMany({
-      where: { examId },
+    const ownerMember = await prisma.examMember.findFirst({
+      where: { examId, userId, role: ExamRole.OWNER },
       select: { id: true },
     });
-    const attemptIds = attempts.map((a) => a.id);
 
-    // 2) Borrar dependencias de los intentos (answers, events, messages)
-    if (attemptIds.length > 0) {
-      await prisma.answer.deleteMany({
-        where: { attemptId: { in: attemptIds } },
-      });
-
-      await prisma.event.deleteMany({
-        where: { attemptId: { in: attemptIds } },
-      });
-
-      await prisma.message.deleteMany({
-        where: { attemptId: { in: attemptIds } },
-      });
-
-      await prisma.attempt.deleteMany({
-        where: { id: { in: attemptIds } },
-      });
+    if (exam.ownerId !== userId && !ownerMember) {
+      return res.status(403).json({ error: "FORBIDDEN" });
     }
 
-    // 3) Borrar preguntas del examen
-    await prisma.question.deleteMany({
-      where: { examId },
+    await prisma.$transaction(async (tx) => {
+      // 1) Borrar invitaciones y membresías (FK RESTRICT)
+      await tx.examInvite.deleteMany({ where: { examId } });
+      await tx.examMember.deleteMany({ where: { examId } });
+
+      // 2) Traer IDs de intentos de ese examen
+      const attempts = await tx.attempt.findMany({
+        where: { examId },
+        select: { id: true },
+      });
+      const attemptIds = attempts.map((a) => a.id);
+
+      // 3) Borrar dependencias de los intentos (answers, events, messages)
+      if (attemptIds.length > 0) {
+        await tx.answer.deleteMany({
+          where: { attemptId: { in: attemptIds } },
+        });
+
+        await tx.event.deleteMany({
+          where: { attemptId: { in: attemptIds } },
+        });
+
+        await tx.message.deleteMany({
+          where: { attemptId: { in: attemptIds } },
+        });
+
+        await tx.attempt.deleteMany({
+          where: { id: { in: attemptIds } },
+        });
+      }
+
+      // 4) Borrar preguntas del examen
+      await tx.question.deleteMany({
+        where: { examId },
+      });
+
+      // 5) Borrar tablas raw defensivamente
+      await tx.$executeRawUnsafe(
+        `DELETE FROM "QuestionLite" WHERE "examId" = $1`,
+        examId
+      );
+      await tx.$executeRawUnsafe(
+        `DELETE FROM "ExamChatLite" WHERE "examId" = $1`,
+        examId
+      );
+
+      // 6) Finalmente borrar el examen
+      await tx.exam.delete({
+        where: { id: examId },
+      });
     });
 
-    // 4) Finalmente borrar el examen
-    await prisma.exam.delete({
-      where: { id: examId },
-    });
-
-    return res.json({ ok: true });
+    return res.status(204).send();
   } catch (e: any) {
     console.error("DELETE_EXAM_ERROR", e);
     return res.status(500).json({ error: e?.message || "DELETE_EXAM_ERROR" });
