@@ -320,6 +320,10 @@ teacherRouter.get("/exams", async (req, res) => {
                 code: e.publicCode ?? e.id.slice(0, 6),
                 durationMinutes,
                 lives: e.lives,
+                startsAt: e.startsAt ?? null,
+                endsAt: e.endsAt ?? null,
+                openAt: e.openAt ?? null,
+                gradingMode: e.gradingMode,
                 // Campos nuevos
                 university: e.university,
                 subject: e.subject,
