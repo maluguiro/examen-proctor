@@ -1,2 +1,2 @@
-AlterEnum
+-- AlterEnum
 ALTER TYPE "ExamRole" ADD VALUE 'PROCTOR';
