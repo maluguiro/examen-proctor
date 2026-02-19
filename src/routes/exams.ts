@@ -266,6 +266,7 @@ function toMetaResponse(exam: any) {
     durationMinutes: typeof d === "number" ? d : null,
     lives: typeof exam.lives === "number" ? exam.lives : null,
     teacherName: exam.teacherName ?? null,
+    university: exam.university ?? null,
     subject: exam.subject ?? null,
     gradingMode:
       String(exam.gradingMode || "auto").toLowerCase() === "manual"
@@ -276,6 +277,8 @@ function toMetaResponse(exam: any) {
         ? exam.maxScore
         : 0,
     openAt: exam.openAt ?? null,
+    startsAt: exam.startsAt ?? null,
+    endsAt: exam.endsAt ?? null,
     closeAt: exam.endsAt ?? null,
   };
 }
@@ -719,6 +722,13 @@ examsRouter.put("/exams/:code/meta", async (req, res) => {
           : null;
     }
 
+    if (body.university !== undefined) {
+      data.university =
+        typeof body.university === "string" && body.university.trim()
+          ? body.university.trim()
+          : null;
+    }
+
     if (body.subject !== undefined) {
       data.subject =
         typeof body.subject === "string" && body.subject.trim()
@@ -755,6 +765,32 @@ examsRouter.put("/exams/:code/meta", async (req, res) => {
         const d = new Date(body.openAt);
         if (!isNaN(d.getTime())) {
           data.openAt = d;
+        }
+      }
+    }
+
+    const startsAtInput =
+      body.startsAt !== undefined ? body.startsAt : body.examOpenAt;
+    if (startsAtInput !== undefined) {
+      if (!startsAtInput) {
+        data.startsAt = null;
+      } else {
+        const d = new Date(startsAtInput);
+        if (!isNaN(d.getTime())) {
+          data.startsAt = d;
+        }
+      }
+    }
+
+    const endsAtInput =
+      body.endsAt !== undefined ? body.endsAt : body.examCloseAt;
+    if (endsAtInput !== undefined) {
+      if (!endsAtInput) {
+        data.endsAt = null;
+      } else {
+        const d = new Date(endsAtInput);
+        if (!isNaN(d.getTime())) {
+          data.endsAt = d;
         }
       }
     }
@@ -1575,6 +1611,20 @@ examsRouter.post("/exams/:code/attempts/start", async (req, res) => {
 
     if (alreadySubmitted) {
       return res.status(409).json({ error: "ATTEMPT_ALREADY_SUBMITTED" });
+    }
+
+    const now = new Date();
+    if (exam.startsAt instanceof Date && now < exam.startsAt) {
+      return res.status(403).json({
+        error: "EXAM_NOT_OPEN",
+        startsAt: exam.startsAt.toISOString(),
+      });
+    }
+    if (exam.endsAt instanceof Date && now > exam.endsAt) {
+      return res.status(403).json({
+        error: "EXAM_CLOSED",
+        endsAt: exam.endsAt.toISOString(),
+      });
     }
 
     const studentId = studentKey;
@@ -2660,7 +2710,7 @@ examsRouter.patch(
 // DELETE /api/exams/:id
 // Elimina un examen y todas sus dependencias (attempts, answers, events, messages, questions)
 examsRouter.delete("/exams/:id", authMiddleware, async (req, res) => {
-  const examId = req.params.id;
+  const rawId = req.params.id;
 
   try {
     const userId = req.user?.userId;
@@ -2668,13 +2718,20 @@ examsRouter.delete("/exams/:id", authMiddleware, async (req, res) => {
       return res.status(401).json({ error: "UNAUTHORIZED" });
     }
 
-    const exam = await prisma.exam.findUnique({
-      where: { id: examId },
+    let exam = await prisma.exam.findUnique({
+      where: { id: rawId },
     });
+    if (!exam) {
+      exam = await prisma.exam.findFirst({
+        where: { publicCode: rawId },
+      });
+    }
 
     if (!exam) {
       return res.status(404).json({ error: "EXAM_NOT_FOUND" });
     }
+
+    const examId = exam.id;
 
     const ownerMember = await prisma.examMember.findFirst({
       where: { examId, userId, role: ExamRole.OWNER },
@@ -2721,17 +2778,7 @@ examsRouter.delete("/exams/:id", authMiddleware, async (req, res) => {
         where: { examId },
       });
 
-      // 5) Borrar tablas raw defensivamente
-      await tx.$executeRawUnsafe(
-        `DELETE FROM "QuestionLite" WHERE "examId" = $1`,
-        examId
-      );
-      await tx.$executeRawUnsafe(
-        `DELETE FROM "ExamChatLite" WHERE "examId" = $1`,
-        examId
-      );
-
-      // 6) Finalmente borrar el examen
+      // 5) Finalmente borrar el examen
       await tx.exam.delete({
         where: { id: examId },
       });
@@ -2740,6 +2787,9 @@ examsRouter.delete("/exams/:id", authMiddleware, async (req, res) => {
     return res.status(204).send();
   } catch (e: any) {
     console.error("DELETE_EXAM_ERROR", e);
+    if (e?.code === "P2003") {
+      return res.status(409).json({ error: "FK_CONSTRAINT" });
+    }
     return res.status(500).json({ error: e?.message || "DELETE_EXAM_ERROR" });
   }
 });
