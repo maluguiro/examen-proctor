@@ -65,8 +65,20 @@ authRouter.post("/register", async (req, res) => {
             },
         });
     } catch (error: any) {
+        const message = String(error?.message || error || "");
         console.error("REGISTER_ERROR", error);
-        return res.status(500).json({ error: error?.message || "INTERNAL_ERROR" });
+        if (
+            message.includes("Authentication failed") ||
+            message.includes("not available") ||
+            message.includes("Can't reach database server")
+        ) {
+            return res
+                .status(503)
+                .json({ error: "Servicio no disponible. Intentalo más tarde." });
+        }
+        return res
+            .status(500)
+            .json({ error: "Error interno. Intentalo nuevamente." });
     }
 });
 
@@ -116,7 +128,19 @@ authRouter.post("/login", async (req, res) => {
             },
         });
     } catch (error: any) {
+        const message = String(error?.message || error || "");
         console.error("LOGIN_ERROR", error);
-        return res.status(500).json({ error: error?.message || "INTERNAL_ERROR" });
+        if (
+            message.includes("Authentication failed") ||
+            message.includes("not available") ||
+            message.includes("Can't reach database server")
+        ) {
+            return res
+                .status(503)
+                .json({ error: "Servicio no disponible. Intentalo más tarde." });
+        }
+        return res
+            .status(500)
+            .json({ error: "Error interno. Intentalo nuevamente." });
     }
 });

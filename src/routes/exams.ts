@@ -5,7 +5,7 @@ import { prisma } from "../prisma";
 import crypto from "crypto";
 import PDFDocument from "pdfkit";
 import { ExamRole, Prisma } from "@prisma/client";
-import { authMiddleware } from "../authMiddleware"; // Necesario para asegurar user en request si se usa en rutas protegidas explícitas
+import { authMiddleware, optionalAuthMiddleware } from "../authMiddleware"; // Necesario para asegurar user en request si se usa en rutas protegidas explícitas
 
 export const examsRouter = Router();
 
@@ -90,6 +90,25 @@ function logRawError(route: string, sql: string, err: any) {
     message: err?.message ?? String(err),
     sql,
   });
+}
+
+function respondSanitizedError(
+  res: any,
+  err: any,
+  fallbackError = "INTERNAL_ERROR"
+) {
+  const message = String(err?.message || err || "");
+  if (process.env.NODE_ENV !== "production") {
+    console.error("SERVER_ERROR", err);
+  }
+  if (
+    message.includes("Authentication failed") ||
+    message.includes("not available") ||
+    message.includes("Can't reach database server")
+  ) {
+    return res.status(503).json({ error: "SERVICE_UNAVAILABLE" });
+  }
+  return res.status(500).json({ error: fallbackError });
 }
 
 async function hasExamRole(
@@ -488,6 +507,29 @@ function wrapAnswerContent(existingContent: any, teacherFeedback?: string | null
   return { value, teacherFeedback };
 }
 
+function mergeTeacherFeedback(existingContent: any, teacherFeedback: string | null) {
+  if (existingContent && typeof existingContent === "object" && "value" in existingContent) {
+    return { ...(existingContent as any), teacherFeedback };
+  }
+  return { value: existingContent ?? null, teacherFeedback };
+}
+
+const OVERALL_FEEDBACK_QID = "__overall__";
+
+function normalizeOverallFeedback(raw: any): string | null {
+  if (raw === undefined) return null;
+  if (raw === null) return "";
+  return String(raw);
+}
+
+function extractOverallFeedback(content: any): string | null {
+  if (content && typeof content === "object") {
+    const tf = (content as any).teacherFeedback;
+    if (typeof tf === "string") return tf;
+  }
+  return null;
+}
+
 /** Asegura la tabla QuestionLite (se comparte el formato con el builder) */
 async function ensureQuestionLite() {
   await prisma.$executeRawUnsafe(`
@@ -553,10 +595,10 @@ examsRouter.get("/exams/by-code/:code", async (req, res) => {
         code: exam.publicCode ?? exam.id.slice(0, 6),
       },
     });
-  } catch (e: any) {
-    return res.status(500).json({ error: e?.message || String(e) });
-  }
-});
+    } catch (e: any) {
+      return respondSanitizedError(res, e, "GRADING_MANUAL_EXAMS_ERROR");
+    }
+  });
 
 /**
  * GET /api/exams/:code
@@ -832,14 +874,14 @@ examsRouter.get("/exams/:code/attempts", authMiddleware, async (req, res) => {
       return res.status(403).json({ error: "FORBIDDEN" });
     }
 
-    const attempts = await prisma.attempt.findMany({
-      where: isBandeja
-        ? {
-            examId: exam.id,
-            endAt: { not: null },
-            status: { in: ["submitted", "in_review", "graded"] },
-          }
-        : { examId: exam.id },
+      const attempts = await prisma.attempt.findMany({
+        where: isBandeja
+          ? {
+              examId: exam.id,
+              endAt: { not: null },
+              status: { in: ["submitted", "in_review", "graded", "finished"] },
+            }
+          : { examId: exam.id },
       orderBy: isBandeja ? { endAt: "desc" } : { startAt: "asc" },
       select: {
         id: true,
@@ -965,17 +1007,17 @@ examsRouter.get("/exams/:code/attempts", authMiddleware, async (req, res) => {
       };
     });
 
-    if (String(req.query.view || "").toLowerCase() === "bandeja") {
-      const minimal = normalizedAttempts.map((a) => ({
-        id: a.id,
-        studentName: a.studentName || "(sin nombre)",
-        studentEmail: null,
-        submittedAt: a.endAt ?? null,
-        status: a.status ?? "in_progress",
-        score: a.score ?? null,
-      }));
-      return res.json(minimal);
-    }
+      if (String(req.query.view || "").toLowerCase() === "bandeja") {
+        const items = normalizedAttempts.map((a) => ({
+          id: a.id,
+          studentName: a.studentName || "(sin nombre)",
+          studentEmail: null,
+          submittedAt: a.endAt ?? null,
+          status: a.status ?? "in_progress",
+          score: a.score ?? null,
+        }));
+        return res.json({ items });
+      }
 
     return res.json({
       exam: {
@@ -2129,6 +2171,38 @@ function normalizeQuestionKind(kind: any): string {
   return k;
 }
 
+function splitFibParts(stem: string): { parts: string[]; blanks: number } {
+  const parts: string[] = [];
+  const re = /\[\[(.*?)\]\]/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  let blanks = 0;
+
+  while ((match = re.exec(stem)) !== null) {
+    parts.push(stem.slice(lastIndex, match.index));
+    lastIndex = match.index + match[0].length;
+    blanks += 1;
+  }
+  parts.push(stem.slice(lastIndex));
+
+  return { parts, blanks };
+}
+
+function extractFibAnswers(raw: any): string[] {
+  if (raw == null) return [];
+  if (Array.isArray(raw)) return raw.map((x) => String(x ?? ""));
+  if (typeof raw === "string") return [raw];
+  if (raw && typeof raw === "object") {
+    if (Array.isArray((raw as any).answers)) {
+      return (raw as any).answers.map((x: any) => String(x ?? ""));
+    }
+    if (Array.isArray((raw as any).values)) {
+      return (raw as any).values.map((x: any) => String(x ?? ""));
+    }
+  }
+  return [String(raw)];
+}
+
 // Serializa el valor de respuesta para guardarlo en Answer.content
 function serializeAnswerContent(kind: any, value: any): string | null {
   const k = normalizeQuestionKind(kind);
@@ -2169,12 +2243,125 @@ function serializeAnswerContent(kind: any, value: any): string | null {
  *   answers: [{ questionId, value }]
  * }
  */
-examsRouter.post("/attempts/:id/submit", async (req, res) => {
-  let sql = "";
-  try {
+  examsRouter.post("/attempts/:id/submit", async (req, res) => {
+    let sql = "";
+    try {
     const attempt = await prisma.attempt.findUnique({
       where: { id: req.params.id },
-    });
+  });
+
+  /**
+   * GET /api/attempts/:attemptId
+   * Devuelve estado mínimo para reanudar intento (alumno).
+   * Body/Query: ?includeAnswers=1 (opcional).
+   */
+  examsRouter.get(
+    "/attempts/:attemptId",
+    optionalAuthMiddleware,
+    async (req, res) => {
+      try {
+        const attemptId = String(req.params.attemptId || "").trim();
+        if (!attemptId) {
+          return res.status(400).json({ error: "ATTEMPT_ID_REQUIRED" });
+        }
+
+        const attempt = await prisma.attempt.findUnique({
+          where: { id: attemptId },
+          select: {
+            id: true,
+            examId: true,
+            status: true,
+            startAt: true,
+            endAt: true,
+            score: true,
+          },
+        });
+        if (!attempt) {
+          return res.status(404).json({ error: "ATTEMPT_NOT_FOUND" });
+        }
+
+        const exam = await prisma.exam.findUnique({
+          where: { id: attempt.examId },
+          select: { id: true, gradingMode: true, openAt: true, maxScore: true },
+        });
+        if (!exam) {
+          return res.status(404).json({ error: "EXAM_NOT_FOUND" });
+        }
+
+        const includeAnswers =
+          String(req.query.includeAnswers || "") === "1";
+
+        let answers: Array<{ questionId: string; value: any }> | undefined;
+        if (includeAnswers) {
+          const rows = await prisma.answer.findMany({
+            where: { attemptId },
+            select: { questionId: true, content: true },
+          });
+          answers = rows.map((r) => ({
+            questionId: r.questionId,
+            value: unwrapAnswerContent(r.content).value ?? null,
+          }));
+        }
+
+        let maxScore: number | null =
+          typeof exam.maxScore === "number" && !Number.isNaN(exam.maxScore)
+            ? exam.maxScore
+            : null;
+        if (maxScore == null) {
+          await ensureQuestionLite();
+          const maxScoreRow = await prisma.$queryRawUnsafe<{ total: number }[]>(
+            `SELECT COALESCE(SUM(points),0) as total FROM "QuestionLite" WHERE "examId" = $1`,
+            exam.id
+          );
+          maxScore =
+            Array.isArray(maxScoreRow) && maxScoreRow[0]
+              ? Number(maxScoreRow[0].total ?? 0)
+              : 0;
+        }
+
+        const gradingMode =
+          String(exam.gradingMode || "auto").toLowerCase() === "manual"
+            ? "manual"
+            : "auto";
+        const reviewAvailableAt = exam.openAt ?? null;
+        const now = new Date();
+        let canReview = false;
+        let reviewBlockedReason: "NOT_GRADED" | "NOT_OPEN_YET" | "OK" =
+          "NOT_GRADED";
+        if (attempt.status === "graded") {
+          if (reviewAvailableAt && new Date(reviewAvailableAt) > now) {
+            canReview = false;
+            reviewBlockedReason = "NOT_OPEN_YET";
+          } else {
+            canReview = true;
+            reviewBlockedReason = "OK";
+          }
+        }
+
+        return res.json({
+          id: attempt.id,
+          examId: attempt.examId,
+          status: attempt.status,
+          startedAt: attempt.startAt ?? null,
+          endAt: attempt.endAt ?? null,
+          gradingMode,
+          reviewAvailableAt,
+          canReview,
+          reviewBlockedReason,
+          totals: {
+            totalScore:
+              typeof attempt.score === "number" && !Number.isNaN(attempt.score)
+                ? attempt.score
+                : null,
+            maxScore,
+          },
+          ...(includeAnswers ? { answers } : {}),
+        });
+      } catch (e: any) {
+        return respondSanitizedError(res, e, "ATTEMPT_STATUS_ERROR");
+      }
+    }
+  );
     if (!attempt) {
       return res.status(404).json({ error: "ATTEMPT_NOT_FOUND" });
     }
@@ -2361,7 +2548,7 @@ examsRouter.post("/attempts/:id/submit", async (req, res) => {
  * GET /api/attempts/:id/review
  * (versión mínima: solo disponible si gradingMode = auto y el intento terminó)
  */
-examsRouter.get("/attempts/:id/review", async (req, res) => {
+examsRouter.get("/attempts/:id/review", optionalAuthMiddleware, async (req, res) => {
   let sql = "";
   try {
     const at = await prisma.attempt.findUnique({
@@ -2387,7 +2574,17 @@ examsRouter.get("/attempts/:id/review", async (req, res) => {
       openAtOk = exam.openAt <= now;
     }
 
-    const canSee = gradingMode === "auto" && hasEnded && openAtOk;
+    let teacherOverride = false;
+    if (req.user?.userId) {
+      const allowed = await hasExamRole(exam, req.user.userId, [
+        ExamRole.OWNER,
+        ExamRole.GRADER,
+        ExamRole.PROCTOR,
+      ]);
+      teacherOverride = allowed;
+    }
+
+    const canSee = teacherOverride || (gradingMode === "auto" && hasEnded && openAtOk);
 
     if (!canSee) {
       // caso especial: corrección auto + intento terminado + openAt en el futuro
@@ -2476,7 +2673,7 @@ examsRouter.get("/attempts/:id/review", async (req, res) => {
     });
   } catch (e: any) {
     logRawError("/api/attempts/:id/review", sql, e);
-    return res.status(500).json({ error: e?.message || String(e) });
+    return respondSanitizedError(res, e, "REVIEW_ERROR");
   }
 });
 
@@ -2484,11 +2681,11 @@ examsRouter.get("/attempts/:id/review", async (req, res) => {
  * GET /api/exams/:code/attempts/:attemptId/grading
  * Corrección manual: devuelve preguntas + respuestas + puntajes docentes.
  */
-examsRouter.get(
-  "/exams/:code/attempts/:attemptId/grading",
-  authMiddleware,
-  async (req, res) => {
-    let sql = "";
+  examsRouter.get(
+    "/exams/:code/attempts/:attemptId/grading",
+    authMiddleware,
+    async (req, res) => {
+      let sql = "";
     try {
       const userId = req.user?.userId;
       if (!userId) return res.status(401).json({ error: "UNAUTHORIZED" });
@@ -2510,6 +2707,17 @@ examsRouter.get(
       });
       if (!attempt) return res.status(404).json({ error: "ATTEMPT_NOT_FOUND" });
 
+      if (String(attempt.status || "").toLowerCase() === "graded") {
+        const openAt = exam.openAt instanceof Date ? exam.openAt : null;
+        const now = new Date();
+        if (openAt && openAt <= now) {
+          return res.status(409).json({
+            error: "REVIEW_ALREADY_OPEN",
+            message: "La revisión ya está habilitada. No se puede editar.",
+          });
+        }
+      }
+
       await ensureQuestionLite();
 
       sql = `
@@ -2525,17 +2733,19 @@ examsRouter.get(
         select: { questionId: true, content: true, score: true },
       });
       const byQ = new Map(answers.map((a) => [a.questionId, a]));
+      const overallFeedback =
+        extractOverallFeedback(byQ.get(OVERALL_FEEDBACK_QID)?.content) ?? null;
 
       let maxPoints = 0;
       let currentScore = 0;
 
-      const questions = qs.map((q) => {
-        let options: any = null;
-        try {
-          options = q.choices ? JSON.parse(String(q.choices)) : null;
-        } catch {
-          options = null;
-        }
+          const questions = qs.map((q) => {
+            let options: any = null;
+            try {
+              options = q.choices ? JSON.parse(String(q.choices)) : null;
+            } catch {
+              options = null;
+            }
 
         let correctAnswer: any = null;
         try {
@@ -2547,57 +2757,79 @@ examsRouter.get(
         const max = Number(q.points ?? 1) || 1;
         maxPoints += max;
 
-        const a = byQ.get(q.id);
-        const unwrapped = unwrapAnswerContent(a?.content ?? null);
-        const score = typeof a?.score === "number" ? a.score : null;
-        if (typeof score === "number") currentScore += score;
+            const a = byQ.get(q.id);
+            const unwrapped = unwrapAnswerContent(a?.content ?? null);
+            const score = typeof a?.score === "number" ? a.score : null;
+            if (typeof score === "number") currentScore += score;
 
-        return {
-          questionId: q.id,
-          type: normalizeQuestionKind(q.kind),
-          prompt: q.stem,
-          options,
-          correctAnswer,
-          maxPoints: max,
-          studentAnswer: unwrapped.value ?? null,
-          teacherScore: score,
-          teacherFeedback: unwrapped.teacherFeedback,
-        };
-      });
+            const kind = normalizeQuestionKind(q.kind);
+            const fib =
+              kind === "FILL_IN"
+                ? (() => {
+                    const prompt = String(q.stem ?? "");
+                    const { parts, blanks } = splitFibParts(prompt);
+                    return {
+                      parts,
+                      blanks,
+                      correctAnswers: extractFibAnswers(correctAnswer),
+                      studentAnswers: extractFibAnswers(unwrapped.value),
+                    };
+                  })()
+                : undefined;
 
-      return res.json({
-        attempt: {
-          id: attempt.id,
-          studentName: attempt.studentName ?? null,
-          status: attempt.status ?? null,
-          submittedAt: attempt.endAt ?? null,
-          score: attempt.score ?? null,
-        },
-        questions,
-        totals: {
-          maxPoints,
-          currentScore,
-        },
-      });
-    } catch (e: any) {
-      logRawError("/api/exams/:code/attempts/:attemptId/grading", sql, e);
-      if (process.env.NODE_ENV !== "production") {
-        console.error("GRADING_GET_ERROR", e);
+          const item = {
+            questionId: q.id,
+            type: kind,
+            prompt: q.stem,
+            options,
+            correctAnswer,
+            maxPoints: max,
+            maxScore: max,
+            studentAnswer: unwrapped.value ?? null,
+            teacherScore: score,
+            teacherFeedback: unwrapped.teacherFeedback,
+            feedback: unwrapped.teacherFeedback,
+            ...(fib ? { fib } : {}),
+          };
+          if (fib) (item as any).fibNormalized = fib;
+          return item;
+        });
+
+          return res.json({
+            attempt: {
+              id: attempt.id,
+              studentName: attempt.studentName ?? null,
+              status: attempt.status ?? null,
+              startedAt: attempt.startAt ?? null,
+              submittedAt: attempt.endAt ?? null,
+              endAt: attempt.endAt ?? null,
+              score: attempt.score ?? null,
+            },
+            overallFeedback,
+            questions,
+            totals: {
+              maxPoints,
+              currentScore,
+              maxScore: maxPoints,
+              totalScore: currentScore,
+            },
+          });
+      } catch (e: any) {
+        logRawError("/api/exams/:code/attempts/:attemptId/grading", sql, e);
+        return respondSanitizedError(res, e, "GRADING_GET_ERROR");
       }
-      return res.status(500).json({ error: e?.message || String(e) });
     }
-  }
-);
+  );
 
 /**
  * PATCH /api/exams/:code/attempts/:attemptId/grading
  * Body: { perQuestion: [{ questionId, score, feedback? }], finalize?: boolean }
  */
-examsRouter.patch(
-  "/exams/:code/attempts/:attemptId/grading",
-  authMiddleware,
-  async (req, res) => {
-    try {
+  examsRouter.patch(
+    "/exams/:code/attempts/:attemptId/grading",
+    authMiddleware,
+    async (req, res) => {
+      try {
       const userId = req.user?.userId;
       if (!userId) return res.status(401).json({ error: "UNAUTHORIZED" });
 
@@ -2619,16 +2851,55 @@ examsRouter.patch(
       if (!attempt) return res.status(404).json({ error: "ATTEMPT_NOT_FOUND" });
 
       const body = req.body ?? {};
+      const hasOverallFeedback = Object.prototype.hasOwnProperty.call(
+        body,
+        "overallFeedback"
+      );
+      if (hasOverallFeedback) {
+        const overallFeedbackRaw = normalizeOverallFeedback(
+          body.overallFeedback
+        );
+        const overallFeedback = overallFeedbackRaw ?? "";
+        if (overallFeedback.length > 2000) {
+          return res.status(400).json({ error: "OVERALL_FEEDBACK_TOO_LARGE" });
+        }
+
+        const existingOverall = await prisma.answer.findFirst({
+          where: { attemptId: attempt.id, questionId: OVERALL_FEEDBACK_QID },
+        });
+        if (existingOverall) {
+          await prisma.answer.update({
+            where: { id: existingOverall.id },
+            data: {
+              content: mergeTeacherFeedback(
+                existingOverall.content,
+                overallFeedback
+              ),
+              score: null,
+            },
+          });
+        } else {
+          await prisma.answer.create({
+            data: {
+              attemptId: attempt.id,
+              questionId: OVERALL_FEEDBACK_QID,
+              score: null,
+              content: mergeTeacherFeedback(null, overallFeedback),
+            },
+          });
+        }
+      }
+
       const perQuestion = Array.isArray(body.perQuestion)
         ? body.perQuestion
         : null;
       if (!perQuestion) {
-        return res.status(400).json({ error: "PER_QUESTION_REQUIRED" });
+        return res.json({ ok: true, overallFeedback: hasOverallFeedback ? body.overallFeedback ?? "" : null });
       }
 
-      for (const item of perQuestion) {
-        const questionId = String(item?.questionId || "").trim();
-        if (!questionId) continue;
+          for (const item of perQuestion) {
+            const questionId = String(item?.questionId || "").trim();
+            if (!questionId) continue;
 
         const scoreRaw = item?.score;
         const score =
@@ -2639,8 +2910,26 @@ examsRouter.patch(
           return res.status(400).json({ error: "SCORE_INVALID" });
         }
 
-        const feedback =
-          item?.feedback !== undefined ? String(item.feedback) : undefined;
+        const feedbackProvided =
+          Object.prototype.hasOwnProperty.call(item, "teacherFeedback") ||
+          Object.prototype.hasOwnProperty.call(item, "feedback");
+        const feedbackRaw = Object.prototype.hasOwnProperty.call(
+          item,
+          "teacherFeedback"
+        )
+          ? item.teacherFeedback
+          : item?.feedback;
+        if (feedbackProvided) {
+          const str = feedbackRaw === null ? "" : String(feedbackRaw ?? "");
+          if (str.length > 2000) {
+            return res.status(400).json({ error: "FEEDBACK_TOO_LARGE" });
+          }
+        }
+        const feedback = feedbackProvided
+          ? feedbackRaw === null
+            ? null
+            : String(feedbackRaw ?? "")
+          : undefined;
 
         const existing = await prisma.answer.findFirst({
           where: { attemptId: attempt.id, questionId },
@@ -2649,8 +2938,8 @@ examsRouter.patch(
         if (existing) {
           const data: any = {};
           if (score !== null) data.score = score;
-          if (feedback !== undefined) {
-            data.content = wrapAnswerContent(existing.content, feedback);
+          if (feedbackProvided) {
+            data.content = mergeTeacherFeedback(existing.content, feedback);
           }
           if (Object.keys(data).length > 0) {
             await prisma.answer.update({
@@ -2664,10 +2953,9 @@ examsRouter.patch(
               attemptId: attempt.id,
               questionId,
               score: score ?? null,
-              content:
-                feedback !== undefined
-                  ? wrapAnswerContent(null, feedback)
-                  : Prisma.DbNull,
+              content: feedbackProvided
+                ? mergeTeacherFeedback(null, feedback)
+                : Prisma.DbNull,
             },
           });
         }
@@ -2681,11 +2969,9 @@ examsRouter.patch(
         return sum + (typeof a.score === "number" ? a.score : 0);
       }, 0);
 
-      const finalize = body.finalize === true;
       const dataToUpdate: any = {
         score: totalScore,
       };
-      if (finalize) dataToUpdate.status = "graded";
 
       const updatedAttempt = await prisma.attempt.update({
         where: { id: attempt.id },
@@ -2693,20 +2979,550 @@ examsRouter.patch(
         select: { id: true, status: true, score: true },
       });
 
-      return res.json({
-        ok: true,
-        attemptId: updatedAttempt.id,
-        status: updatedAttempt.status,
-        totalScore: updatedAttempt.score ?? null,
-      });
-    } catch (e: any) {
-      if (process.env.NODE_ENV !== "production") {
-        console.error("GRADING_PATCH_ERROR", e);
+        return res.json({
+          ok: true,
+          attemptId: updatedAttempt.id,
+          status: updatedAttempt.status,
+          totalScore: updatedAttempt.score ?? null,
+        });
+      } catch (e: any) {
+        return respondSanitizedError(res, e, "GRADING_PATCH_ERROR");
       }
-      return res.status(500).json({ error: e?.message || String(e) });
     }
-  }
-);
+  );
+
+  /**
+   * GET /api/teacher/grading/attempts/:attemptId
+   * Corrección manual: detalle del intento sin necesidad de code.
+   */
+  examsRouter.get(
+    "/teacher/grading/attempts/:attemptId",
+    authMiddleware,
+    async (req, res) => {
+      let sql = "";
+      try {
+        const userId = req.user?.userId;
+        if (!userId) return res.status(401).json({ error: "UNAUTHORIZED" });
+
+        const attempt = await prisma.attempt.findUnique({
+          where: { id: req.params.attemptId },
+          include: { exam: true },
+        });
+        if (!attempt) return res.status(404).json({ error: "ATTEMPT_NOT_FOUND" });
+        const exam = attempt.exam;
+        if (!exam) return res.status(404).json({ error: "EXAM_NOT_FOUND" });
+
+        const allowed = await hasExamRole(exam, userId, [
+          ExamRole.OWNER,
+          ExamRole.GRADER,
+          ExamRole.PROCTOR,
+        ]);
+        if (!allowed) {
+          return res.status(403).json({ error: "FORBIDDEN" });
+        }
+
+        if (String(attempt.status || "").toLowerCase() === "graded") {
+          const openAt = exam.openAt instanceof Date ? exam.openAt : null;
+          const now = new Date();
+          if (openAt && openAt <= now) {
+            return res.status(409).json({
+              error: "REVIEW_ALREADY_OPEN",
+              message: "La revisión ya está habilitada. No se puede editar.",
+            });
+          }
+        }
+
+        if (String(attempt.status || "").toLowerCase() === "graded") {
+          const openAt = exam.openAt instanceof Date ? exam.openAt : null;
+          const now = new Date();
+          if (openAt && openAt <= now) {
+            return res.status(409).json({
+              error: "REVIEW_ALREADY_OPEN",
+              message: "La revisión ya está habilitada. No se puede editar.",
+            });
+          }
+        }
+
+        await ensureQuestionLite();
+
+        sql = `
+          SELECT id, kind, stem, choices, answer, points
+          FROM "QuestionLite"
+          WHERE "examId" = $1
+          ORDER BY "createdAt" ASC
+        `;
+        const qs: any[] = await prisma.$queryRawUnsafe(sql, exam.id);
+
+        const answers = await prisma.answer.findMany({
+          where: { attemptId: attempt.id },
+          select: { questionId: true, content: true, score: true },
+        });
+        const byQ = new Map(answers.map((a) => [a.questionId, a]));
+        const overallFeedback =
+          extractOverallFeedback(byQ.get(OVERALL_FEEDBACK_QID)?.content) ?? null;
+
+        let maxPoints = 0;
+        let currentScore = 0;
+
+        const questions = qs.map((q) => {
+          let options: any = null;
+          try {
+            options = q.choices ? JSON.parse(String(q.choices)) : null;
+          } catch {
+            options = null;
+          }
+
+          let correctAnswer: any = null;
+          try {
+            correctAnswer = q.answer ? JSON.parse(String(q.answer)) : null;
+          } catch {
+            correctAnswer = null;
+          }
+
+          const max = Number(q.points ?? 1) || 1;
+          maxPoints += max;
+
+          const a = byQ.get(q.id);
+          const unwrapped = unwrapAnswerContent(a?.content ?? null);
+          const score = typeof a?.score === "number" ? a.score : null;
+          if (typeof score === "number") currentScore += score;
+
+          const kind = normalizeQuestionKind(q.kind);
+          const fib =
+            kind === "FILL_IN"
+              ? (() => {
+                  const prompt = String(q.stem ?? "");
+                  const { parts, blanks } = splitFibParts(prompt);
+                  return {
+                    parts,
+                    blanks,
+                    correctAnswers: extractFibAnswers(correctAnswer),
+                    studentAnswers: extractFibAnswers(unwrapped.value),
+                  };
+                })()
+              : undefined;
+
+            const item = {
+              questionId: q.id,
+              type: kind,
+              prompt: q.stem,
+              options,
+              correctAnswer,
+              maxPoints: max,
+              maxScore: max,
+              studentAnswer: unwrapped.value ?? null,
+              teacherScore: score,
+              teacherFeedback: unwrapped.teacherFeedback,
+              feedback: unwrapped.teacherFeedback,
+              ...(fib ? { fib } : {}),
+            };
+            if (fib) (item as any).fibNormalized = fib;
+            return item;
+          });
+
+          return res.json({
+            attempt: {
+              id: attempt.id,
+              studentName: attempt.studentName ?? null,
+              status: attempt.status ?? null,
+              startedAt: attempt.startAt ?? null,
+              submittedAt: attempt.endAt ?? null,
+              endAt: attempt.endAt ?? null,
+              score: attempt.score ?? null,
+            },
+            overallFeedback,
+            questions,
+            totals: {
+              maxPoints,
+              currentScore,
+              maxScore: maxPoints,
+              totalScore: currentScore,
+            },
+          });
+      } catch (e: any) {
+        logRawError("/api/teacher/grading/attempts/:attemptId", sql, e);
+        return respondSanitizedError(res, e, "GRADING_GET_ERROR");
+      }
+    }
+  );
+
+  /**
+   * PATCH /api/teacher/grading/attempts/:attemptId/draft
+   * Body: { perQuestion: [{ questionId, score, feedback? }], totalScore? }
+   */
+  examsRouter.patch(
+    "/teacher/grading/attempts/:attemptId/draft",
+    authMiddleware,
+    async (req, res) => {
+      try {
+        const userId = req.user?.userId;
+        if (!userId) return res.status(401).json({ error: "UNAUTHORIZED" });
+
+        const attempt = await prisma.attempt.findUnique({
+          where: { id: req.params.attemptId },
+          include: { exam: true },
+        });
+        if (!attempt) return res.status(404).json({ error: "ATTEMPT_NOT_FOUND" });
+        const exam = attempt.exam;
+        if (!exam) return res.status(404).json({ error: "EXAM_NOT_FOUND" });
+
+        const allowed = await hasExamRole(exam, userId, [
+          ExamRole.OWNER,
+          ExamRole.GRADER,
+          ExamRole.PROCTOR,
+        ]);
+        if (!allowed) {
+          return res.status(403).json({ error: "FORBIDDEN" });
+        }
+
+        const body = req.body ?? {};
+        const hasOverallFeedback = Object.prototype.hasOwnProperty.call(
+          body,
+          "overallFeedback"
+        );
+        if (hasOverallFeedback) {
+          const overallFeedbackRaw = normalizeOverallFeedback(
+            body.overallFeedback
+          );
+          const overallFeedback = overallFeedbackRaw ?? "";
+          if (overallFeedback.length > 2000) {
+            return res.status(400).json({ error: "OVERALL_FEEDBACK_TOO_LARGE" });
+          }
+
+          const existingOverall = await prisma.answer.findFirst({
+            where: { attemptId: attempt.id, questionId: OVERALL_FEEDBACK_QID },
+          });
+          if (existingOverall) {
+            await prisma.answer.update({
+              where: { id: existingOverall.id },
+              data: {
+                content: mergeTeacherFeedback(
+                  existingOverall.content,
+                  overallFeedback
+                ),
+                score: null,
+              },
+            });
+          } else {
+            await prisma.answer.create({
+              data: {
+                attemptId: attempt.id,
+                questionId: OVERALL_FEEDBACK_QID,
+                score: null,
+                content: mergeTeacherFeedback(null, overallFeedback),
+              },
+            });
+          }
+        }
+
+        const perQuestion = Array.isArray(body.perQuestion)
+          ? body.perQuestion
+          : null;
+        if (!perQuestion) {
+          return res.json({ ok: true, overallFeedback: hasOverallFeedback ? body.overallFeedback ?? "" : null });
+        }
+
+        for (const item of perQuestion) {
+          const questionId = String(item?.questionId || "").trim();
+          if (!questionId) continue;
+
+          const scoreRaw = item?.score;
+          const score =
+            scoreRaw === null || scoreRaw === undefined
+              ? null
+              : Math.max(0, Number(scoreRaw));
+          if (score !== null && Number.isNaN(score)) {
+            return res.status(400).json({ error: "SCORE_INVALID" });
+          }
+
+          const feedbackProvided =
+            Object.prototype.hasOwnProperty.call(item, "teacherFeedback") ||
+            Object.prototype.hasOwnProperty.call(item, "feedback");
+          const feedbackRaw = Object.prototype.hasOwnProperty.call(
+            item,
+            "teacherFeedback"
+          )
+            ? item.teacherFeedback
+            : item?.feedback;
+          if (feedbackProvided) {
+            const str = feedbackRaw === null ? "" : String(feedbackRaw ?? "");
+            if (str.length > 2000) {
+              return res.status(400).json({ error: "FEEDBACK_TOO_LARGE" });
+            }
+          }
+          const feedback = feedbackProvided
+            ? feedbackRaw === null
+              ? null
+              : String(feedbackRaw ?? "")
+            : undefined;
+
+          const existing = await prisma.answer.findFirst({
+            where: { attemptId: attempt.id, questionId },
+          });
+
+          if (existing) {
+            const data: any = {};
+            if (score !== null) data.score = score;
+            if (feedbackProvided) {
+              data.content = mergeTeacherFeedback(existing.content, feedback);
+            }
+            if (Object.keys(data).length > 0) {
+              await prisma.answer.update({
+                where: { id: existing.id },
+                data,
+              });
+            }
+          } else {
+            await prisma.answer.create({
+              data: {
+                attemptId: attempt.id,
+                questionId,
+                score: score ?? null,
+                content: feedbackProvided
+                  ? mergeTeacherFeedback(null, feedback)
+                  : Prisma.DbNull,
+              },
+            });
+          }
+        }
+
+        if (Object.prototype.hasOwnProperty.call(body, "overallFeedback")) {
+          const overallFeedbackRaw = normalizeOverallFeedback(
+            body.overallFeedback
+          );
+          const overallFeedback = overallFeedbackRaw ?? "";
+          if (overallFeedback.length > 2000) {
+            return res.status(400).json({ error: "OVERALL_FEEDBACK_TOO_LARGE" });
+          }
+
+          const existingOverall = await prisma.answer.findFirst({
+            where: { attemptId: attempt.id, questionId: OVERALL_FEEDBACK_QID },
+          });
+          if (existingOverall) {
+            await prisma.answer.update({
+              where: { id: existingOverall.id },
+              data: {
+                content: wrapAnswerContent(
+                  existingOverall.content,
+                  overallFeedback
+                ),
+                score: null,
+              },
+            });
+          } else {
+            await prisma.answer.create({
+              data: {
+                attemptId: attempt.id,
+                questionId: OVERALL_FEEDBACK_QID,
+                score: null,
+                content: wrapAnswerContent(null, overallFeedback),
+              },
+            });
+          }
+        }
+
+        const allAnswers = await prisma.answer.findMany({
+          where: { attemptId: attempt.id },
+          select: { score: true },
+        });
+        const totalScore = allAnswers.reduce((sum, a) => {
+          return sum + (typeof a.score === "number" ? a.score : 0);
+        }, 0);
+
+        const updatedAttempt = await prisma.attempt.update({
+          where: { id: attempt.id },
+          data: { score: totalScore },
+          select: { id: true, status: true, score: true },
+        });
+
+        return res.json({
+          ok: true,
+          attemptId: updatedAttempt.id,
+          status: updatedAttempt.status,
+          totalScore: updatedAttempt.score ?? null,
+        });
+      } catch (e: any) {
+        return respondSanitizedError(res, e, "GRADING_PATCH_ERROR");
+      }
+    }
+  );
+
+  /**
+   * POST /api/teacher/grading/attempts/:attemptId/finalize
+   * Body: { perQuestion: [{ questionId, score, feedback? }] }
+   */
+  examsRouter.post(
+    "/teacher/grading/attempts/:attemptId/finalize",
+    authMiddleware,
+    async (req, res) => {
+      try {
+        const userId = req.user?.userId;
+        if (!userId) return res.status(401).json({ error: "UNAUTHORIZED" });
+
+        const attempt = await prisma.attempt.findUnique({
+          where: { id: req.params.attemptId },
+          include: { exam: true },
+        });
+        if (!attempt) return res.status(404).json({ error: "ATTEMPT_NOT_FOUND" });
+        const exam = attempt.exam;
+        if (!exam) return res.status(404).json({ error: "EXAM_NOT_FOUND" });
+
+        const allowed = await hasExamRole(exam, userId, [
+          ExamRole.OWNER,
+          ExamRole.GRADER,
+          ExamRole.PROCTOR,
+        ]);
+        if (!allowed) {
+          return res.status(403).json({ error: "FORBIDDEN" });
+        }
+
+        const body = req.body ?? {};
+        const hasOverallFeedback = Object.prototype.hasOwnProperty.call(
+          body,
+          "overallFeedback"
+        );
+        if (hasOverallFeedback) {
+          const overallFeedbackRaw = normalizeOverallFeedback(
+            body.overallFeedback
+          );
+          const overallFeedback = overallFeedbackRaw ?? "";
+          if (overallFeedback.length > 2000) {
+            return res.status(400).json({ error: "OVERALL_FEEDBACK_TOO_LARGE" });
+          }
+
+          const existingOverall = await prisma.answer.findFirst({
+            where: { attemptId: attempt.id, questionId: OVERALL_FEEDBACK_QID },
+          });
+          if (existingOverall) {
+            await prisma.answer.update({
+              where: { id: existingOverall.id },
+              data: {
+                content: mergeTeacherFeedback(
+                  existingOverall.content,
+                  overallFeedback
+                ),
+                score: null,
+              },
+            });
+          } else {
+            await prisma.answer.create({
+              data: {
+                attemptId: attempt.id,
+                questionId: OVERALL_FEEDBACK_QID,
+                score: null,
+                content: mergeTeacherFeedback(null, overallFeedback),
+              },
+            });
+          }
+        }
+
+        const perQuestion = Array.isArray(body.perQuestion)
+          ? body.perQuestion
+          : null;
+        if (!perQuestion) {
+          return res.status(400).json({ error: "PER_QUESTION_REQUIRED" });
+        }
+
+        for (const item of perQuestion) {
+          const questionId = String(item?.questionId || "").trim();
+          if (!questionId) continue;
+
+          const scoreRaw = item?.score;
+          const score =
+            scoreRaw === null || scoreRaw === undefined
+              ? null
+              : Math.max(0, Number(scoreRaw));
+          if (score !== null && Number.isNaN(score)) {
+            return res.status(400).json({ error: "SCORE_INVALID" });
+          }
+
+          const feedbackProvided =
+            Object.prototype.hasOwnProperty.call(item, "teacherFeedback") ||
+            Object.prototype.hasOwnProperty.call(item, "feedback");
+          const feedbackRaw = Object.prototype.hasOwnProperty.call(
+            item,
+            "teacherFeedback"
+          )
+            ? item.teacherFeedback
+            : item?.feedback;
+          if (feedbackProvided) {
+            const str = feedbackRaw === null ? "" : String(feedbackRaw ?? "");
+            if (str.length > 2000) {
+              return res.status(400).json({ error: "FEEDBACK_TOO_LARGE" });
+            }
+          }
+          const feedback = feedbackProvided
+            ? feedbackRaw === null
+              ? null
+              : String(feedbackRaw ?? "")
+            : undefined;
+
+          const existing = await prisma.answer.findFirst({
+            where: { attemptId: attempt.id, questionId },
+          });
+
+          if (existing) {
+            const data: any = {};
+            if (score !== null) data.score = score;
+            if (feedbackProvided) {
+              data.content = mergeTeacherFeedback(existing.content, feedback);
+            }
+            if (Object.keys(data).length > 0) {
+              await prisma.answer.update({
+                where: { id: existing.id },
+                data,
+              });
+            }
+          } else {
+            await prisma.answer.create({
+              data: {
+                attemptId: attempt.id,
+                questionId,
+                score: score ?? null,
+                content: feedbackProvided
+                  ? mergeTeacherFeedback(null, feedback)
+                  : Prisma.DbNull,
+              },
+            });
+            }
+          }
+
+        const allAnswers = await prisma.answer.findMany({
+          where: { attemptId: attempt.id },
+          select: { score: true },
+        });
+          const totalScore = allAnswers.reduce((sum, a) => {
+            return sum + (typeof a.score === "number" ? a.score : 0);
+          }, 0);
+
+          await ensureQuestionLite();
+          const maxScoreRow = await prisma.$queryRawUnsafe<{ total: number }[]>(
+            `SELECT COALESCE(SUM(points),0) as total FROM "QuestionLite" WHERE "examId" = $1`,
+            exam.id
+          );
+          const maxScore =
+            Array.isArray(maxScoreRow) && maxScoreRow[0]
+              ? Number(maxScoreRow[0].total ?? 0)
+              : 0;
+
+          const updatedAttempt = await prisma.attempt.update({
+            where: { id: attempt.id },
+            data: { score: totalScore, status: "graded" },
+            select: { id: true, status: true, score: true },
+          });
+
+          return res.json({
+            ok: true,
+            attemptId: updatedAttempt.id,
+            status: updatedAttempt.status,
+            totalScore: updatedAttempt.score ?? null,
+            maxScore,
+          });
+      } catch (e: any) {
+        return respondSanitizedError(res, e, "GRADING_PATCH_ERROR");
+      }
+    }
+  );
 // DELETE /api/exams/:id
 // Elimina un examen y todas sus dependencias (attempts, answers, events, messages, questions)
 examsRouter.delete("/exams/:id", authMiddleware, async (req, res) => {
@@ -3032,8 +3848,8 @@ examsRouter.get("/attempts/:id/review.print", async (req, res) => {
       let match: RegExpExecArray | null;
       let boxIndex = 0;
 
-      const normStudent = student.map((s) => s || "");
-      const normCorrect = correct.map((c) => c || "");
+      const normStudent = student.map((s) => (s ?? "").toString());
+      const normCorrect = correct.map((c) => (c ?? "").toString());
 
       while ((match = re.exec(stem)) !== null) {
         if (match.index > lastIndex) {
@@ -3043,9 +3859,19 @@ examsRouter.get("/attempts/:id/review.print", async (req, res) => {
         }
 
         const sVal = normStudent[boxIndex] ?? "";
+        const cVal = normCorrect[boxIndex] ?? "";
+        const sTrim = sVal.trim().toLowerCase();
+        const cTrim = cVal.trim().toLowerCase();
+        const isEmpty = sTrim.length === 0;
+        const isCorrect = !isEmpty && cTrim.length > 0 && sTrim === cTrim;
+        const cls = isEmpty
+          ? "fib-input fib-empty"
+          : isCorrect
+          ? "fib-input fib-correct"
+          : "fib-input fib-wrong";
 
-        // Moodle style input look
-        parts.push(`<span class="fib-input">${escapeHtml(sVal || "")}</span>`);
+        // Moodle style input look + estado por acierto
+        parts.push(`<span class="${cls}">${escapeHtml(sVal || "")}</span>`);
 
         boxIndex++;
         lastIndex = match.index + match[0].length;
@@ -3120,6 +3946,7 @@ examsRouter.get("/attempts/:id/review.print", async (req, res) => {
           const strIndex = String(i);
           const isSelected = studentArr.includes(strIndex) || studentArr.includes(choiceLabel) || studentArr.some(s => s.toLowerCase() === choiceLabel.toLowerCase());
           const isCorrectOption = correctArr.includes(strIndex) || correctArr.includes(choiceLabel) || correctArr.some(c => c.toLowerCase() === choiceLabel.toLowerCase());
+          const isWrongSelected = isSelected && !isCorrectOption;
 
           let iconHtml = "";
           if (isSelected) {
@@ -3133,8 +3960,10 @@ examsRouter.get("/attempts/:id/review.print", async (req, res) => {
           // Letras a, b, c...
           const letter = String.fromCharCode(97 + i); // 97 = 'a'
 
+          const itemClass = `choice-item${isCorrectOption ? ' choice-correct' : ''}${isWrongSelected ? ' choice-wrong' : ''}`;
+
           return `
-               <div class="choice-item">
+               <div class="${itemClass}">
                  <div class="radio-sim ${isSelected ? 'selected' : ''}"></div>
                  <div class="choice-text">
                    <strong style="margin-right:4px;">${letter}.</strong> ${escapeHtml(choiceLabel)}
@@ -3333,6 +4162,12 @@ examsRouter.get("/attempts/:id/review.print", async (req, res) => {
       background: #fff; min-width: 80px; text-align: center; border-radius: 2px;
       font-weight: 500; margin: 0 4px; color: #212529;
     }
+    .fib-correct { border-color: #198754; background: #e9f7ef; color: #0f5132; }
+    .fib-wrong { border-color: #dc3545; background: #fce8ea; color: #842029; }
+    .fib-empty { border-color: #ced4da; background: #f8f9fa; color: #6c757d; }
+    .choice-correct .choice-text { color: #198754; }
+    .choice-correct .radio-sim { border-color: #198754; }
+    .choice-wrong .choice-text { color: #dc3545; }
     @media print {
       body { background: #fff; padding: 0; }
       .page { box-shadow: none; border: none; padding: 0; max-width: none; }
