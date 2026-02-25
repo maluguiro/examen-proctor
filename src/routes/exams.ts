@@ -2873,7 +2873,7 @@ examsRouter.get("/attempts/:id/review", optionalAuthMiddleware, async (req, res)
             data: {
               content: mergeTeacherFeedback(
                 existingOverall.content,
-                overallFeedback
+                overallFeedback ?? null
               ),
               score: null,
             },
@@ -2884,7 +2884,7 @@ examsRouter.get("/attempts/:id/review", optionalAuthMiddleware, async (req, res)
               attemptId: attempt.id,
               questionId: OVERALL_FEEDBACK_QID,
               score: null,
-              content: mergeTeacherFeedback(null, overallFeedback),
+              content: mergeTeacherFeedback(null, overallFeedback ?? null),
             },
           });
         }
@@ -2939,7 +2939,10 @@ examsRouter.get("/attempts/:id/review", optionalAuthMiddleware, async (req, res)
           const data: any = {};
           if (score !== null) data.score = score;
           if (feedbackProvided) {
-            data.content = mergeTeacherFeedback(existing.content, feedback);
+            data.content = mergeTeacherFeedback(
+              existing.content,
+              feedback ?? null
+            );
           }
           if (Object.keys(data).length > 0) {
             await prisma.answer.update({
@@ -2954,7 +2957,7 @@ examsRouter.get("/attempts/:id/review", optionalAuthMiddleware, async (req, res)
               questionId,
               score: score ?? null,
               content: feedbackProvided
-                ? mergeTeacherFeedback(null, feedback)
+                ? mergeTeacherFeedback(null, feedback ?? null)
                 : Prisma.DbNull,
             },
           });
@@ -3198,7 +3201,7 @@ examsRouter.get("/attempts/:id/review", optionalAuthMiddleware, async (req, res)
               data: {
                 content: mergeTeacherFeedback(
                   existingOverall.content,
-                  overallFeedback
+                  overallFeedback ?? null
                 ),
                 score: null,
               },
@@ -3209,7 +3212,7 @@ examsRouter.get("/attempts/:id/review", optionalAuthMiddleware, async (req, res)
                 attemptId: attempt.id,
                 questionId: OVERALL_FEEDBACK_QID,
                 score: null,
-                content: mergeTeacherFeedback(null, overallFeedback),
+                content: mergeTeacherFeedback(null, overallFeedback ?? null),
               },
             });
           }
@@ -3264,7 +3267,10 @@ examsRouter.get("/attempts/:id/review", optionalAuthMiddleware, async (req, res)
             const data: any = {};
             if (score !== null) data.score = score;
             if (feedbackProvided) {
-              data.content = mergeTeacherFeedback(existing.content, feedback);
+              data.content = mergeTeacherFeedback(
+                existing.content,
+                feedback ?? null
+              );
             }
             if (Object.keys(data).length > 0) {
               await prisma.answer.update({
@@ -3279,7 +3285,7 @@ examsRouter.get("/attempts/:id/review", optionalAuthMiddleware, async (req, res)
                 questionId,
                 score: score ?? null,
                 content: feedbackProvided
-                  ? mergeTeacherFeedback(null, feedback)
+                  ? mergeTeacherFeedback(null, feedback ?? null)
                   : Prisma.DbNull,
               },
             });
@@ -3399,7 +3405,7 @@ examsRouter.get("/attempts/:id/review", optionalAuthMiddleware, async (req, res)
               data: {
                 content: mergeTeacherFeedback(
                   existingOverall.content,
-                  overallFeedback
+                  overallFeedback ?? null
                 ),
                 score: null,
               },
@@ -3410,7 +3416,7 @@ examsRouter.get("/attempts/:id/review", optionalAuthMiddleware, async (req, res)
                 attemptId: attempt.id,
                 questionId: OVERALL_FEEDBACK_QID,
                 score: null,
-                content: mergeTeacherFeedback(null, overallFeedback),
+                content: mergeTeacherFeedback(null, overallFeedback ?? null),
               },
             });
           }
@@ -3465,7 +3471,10 @@ examsRouter.get("/attempts/:id/review", optionalAuthMiddleware, async (req, res)
             const data: any = {};
             if (score !== null) data.score = score;
             if (feedbackProvided) {
-              data.content = mergeTeacherFeedback(existing.content, feedback);
+              data.content = mergeTeacherFeedback(
+                existing.content,
+                feedback ?? null
+              );
             }
             if (Object.keys(data).length > 0) {
               await prisma.answer.update({
@@ -3480,7 +3489,7 @@ examsRouter.get("/attempts/:id/review", optionalAuthMiddleware, async (req, res)
                 questionId,
                 score: score ?? null,
                 content: feedbackProvided
-                  ? mergeTeacherFeedback(null, feedback)
+                  ? mergeTeacherFeedback(null, feedback ?? null)
                   : Prisma.DbNull,
               },
             });
