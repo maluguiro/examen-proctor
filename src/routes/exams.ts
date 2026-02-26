@@ -1016,7 +1016,7 @@ examsRouter.get("/exams/:code/attempts", authMiddleware, async (req, res) => {
           status: a.status ?? "in_progress",
           score: a.score ?? null,
         }));
-        return res.json({ items });
+        return res.json({ items, reviewOpenAt: exam.openAt ?? null });
       }
 
     return res.json({
@@ -2972,9 +2972,11 @@ examsRouter.get("/attempts/:id/review", optionalAuthMiddleware, async (req, res)
         return sum + (typeof a.score === "number" ? a.score : 0);
       }, 0);
 
+      const finalize = body.finalize === true;
       const dataToUpdate: any = {
         score: totalScore,
       };
+      if (finalize) dataToUpdate.status = "graded";
 
       const updatedAttempt = await prisma.attempt.update({
         where: { id: attempt.id },
